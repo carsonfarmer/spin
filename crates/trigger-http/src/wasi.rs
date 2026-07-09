@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use futures::TryFutureExt;
@@ -16,7 +16,11 @@ use wasmtime_wasi_http::handler::HandlerState;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::{bindings::Proxy, body::HyperIncomingBody as Body};
 
-use crate::{TriggerInstanceBuilder, headers::prepare_request_headers, server::HttpExecutor};
+use crate::{
+    TriggerInstanceBuilder,
+    headers::prepare_request_headers,
+    server::{HttpExecutor, set_request_deadline},
+};
 
 pub(super) fn prepare_request(
     route_match: &RouteMatch<'_, '_>,
@@ -59,10 +63,12 @@ impl<S: HandlerState> HttpExecutor for WasiHttpExecutor<'_, S> {
         route_match: &RouteMatch<'_, '_>,
         mut req: Request<Body>,
         client_addr: SocketAddr,
+        request_deadline: Option<Duration>,
     ) -> Result<Response<Body>> {
         prepare_request(route_match, &mut req, client_addr)?;
 
         let (instance, mut store) = instance_builder.instantiate(()).await?;
+        set_request_deadline(&mut store, request_deadline);
 
         let mut wasi_http = spin_factor_outbound_http::OutboundHttpFactor::get_wasi_http_impl(
             store.data_mut().factors_instance_state_mut(),

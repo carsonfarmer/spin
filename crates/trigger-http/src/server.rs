@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     sync::Arc,
     time::Duration,
+    time::Instant,
 };
 
 use anyhow::{Context, bail};
@@ -58,6 +59,15 @@ use crate::{
 
 pub const MAX_RETRIES: u16 = 10;
 
+pub(crate) fn set_request_deadline<T>(
+    store: &mut spin_core::Store<T>,
+    request_deadline: Option<Duration>,
+) {
+    if let Some(timeout) = request_deadline {
+        store.set_deadline(Instant::now() + timeout);
+    }
+}
+
 /// An HTTP server which runs Spin apps.
 pub struct HttpServer<F: RuntimeFactors> {
     /// The address the server is listening on.
@@ -70,6 +80,8 @@ pub struct HttpServer<F: RuntimeFactors> {
     find_free_port: bool,
     /// The output format for the server's startup information.
     output_format: OutputFormat,
+    /// Hard Wasmtime request deadline for direct HTTP executor paths.
+    request_deadline: Option<Duration>,
     /// Request router.
     router: Router,
     /// The app being triggered.
@@ -159,6 +171,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_trigger_configs,
             component_handler_types,
             output_format,
+            request_deadline: reuse_config.request_deadline,
         })
     }
 
@@ -401,7 +414,13 @@ impl<F: RuntimeFactors> HttpServer<F> {
             HttpExecutorType::Http => match handler_type {
                 HandlerType::Spin => {
                     SpinHttpExecutor
-                        .execute(instance_builder, &route_match, req, client_addr)
+                        .execute(
+                            instance_builder,
+                            &route_match,
+                            req,
+                            client_addr,
+                            self.request_deadline,
+                        )
                         .await
                 }
                 HandlerType::Wasi0_3(_, handler) => {
@@ -413,7 +432,13 @@ impl<F: RuntimeFactors> HttpServer<F> {
                 | HandlerType::Wasi2023_11_10(_)
                 | HandlerType::Wasi2023_10_18(_) => {
                     WasiHttpExecutor { handler_type }
-                        .execute(instance_builder, &route_match, req, client_addr)
+                        .execute(
+                            instance_builder,
+                            &route_match,
+                            req,
+                            client_addr,
+                            self.request_deadline,
+                        )
                         .await
                 }
                 HandlerType::Wagi(_) => unreachable!(),
@@ -428,7 +453,13 @@ impl<F: RuntimeFactors> HttpServer<F> {
                     indices,
                 };
                 executor
-                    .execute(instance_builder, &route_match, req, client_addr)
+                    .execute(
+                        instance_builder,
+                        &route_match,
+                        req,
+                        client_addr,
+                        self.request_deadline,
+                    )
                     .await
             }
         };
@@ -681,6 +712,7 @@ pub(crate) trait HttpExecutor {
         route_match: &RouteMatch<'_, '_>,
         req: Request<Body>,
         client_addr: SocketAddr,
+        request_deadline: Option<Duration>,
     ) -> impl Future<Output = anyhow::Result<Response<Body>>>;
 }
 
@@ -694,14 +726,15 @@ impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
     type StoreData = InstanceState<F::InstanceState, ()>;
 
     fn new_store(&self, _req_id: Option<u64>) -> wasmtime::Result<StoreBundle<Self::StoreData>> {
+        let mut store = self
+            .trigger_app
+            .prepare(&self.component_id)
+            .to_wasmtime_result()?
+            .instantiate_store(())
+            .to_wasmtime_result()?;
+        set_request_deadline(&mut store, self.reuse_config.request_deadline);
         Ok(StoreBundle {
-            store: self
-                .trigger_app
-                .prepare(&self.component_id)
-                .to_wasmtime_result()?
-                .instantiate_store(())
-                .to_wasmtime_result()?
-                .into_inner(),
+            store: store.into_inner(),
             write_profile: Box::new(|_| ()),
         })
     }
