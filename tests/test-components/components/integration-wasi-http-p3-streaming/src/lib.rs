@@ -17,13 +17,17 @@ use {
             },
         },
     },
-    core::mem,
+    core::{
+        mem,
+        sync::atomic::{AtomicU64, Ordering},
+    },
     futures::{stream, StreamExt},
     url::Url,
     wit_bindgen::{rt::async_support, StreamResult},
 };
 
 const MAX_CONCURRENCY: usize = 16;
+static INVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 struct Component;
 
@@ -32,6 +36,7 @@ export!(Component);
 impl Guest for Component {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
         let headers = request.get_headers().copy_all();
+        let invocation = INVOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
 
         Ok(
             match (
@@ -133,13 +138,15 @@ impl Guest for Component {
                             Request::consume_body(request, wit_future::new(|| Ok(())).1);
                         // Forward content-type so the echoed response carries it back
                         // (matches what /echo round-trips).
-                        let outgoing_headers = Fields::from_list(
-                            &headers
-                                .into_iter()
-                                .filter(|(k, _)| k == "content-type")
-                                .collect::<Vec<_>>(),
-                        )
-                        .unwrap();
+                        let mut outgoing_headers = headers
+                            .into_iter()
+                            .filter(|(k, _)| k == "content-type")
+                            .collect::<Vec<_>>();
+                        outgoing_headers.push((
+                            "x-test-instance-invocation".into(),
+                            invocation.to_string().into_bytes(),
+                        ));
+                        let outgoing_headers = Fields::from_list(&outgoing_headers).unwrap();
                         let outgoing_request =
                             Request::new(outgoing_headers, Some(rx), trailers, None).0;
                         outgoing_request.set_method(&method).unwrap();
