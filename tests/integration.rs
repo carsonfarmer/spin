@@ -14,6 +14,97 @@ mod integration_tests {
         assert_spin_request, bootstap_env, http_smoke_test_template, run_test, spin_binary,
     };
 
+    struct TestEmbedder(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl spin_factor_outbound_http::intercept::OutboundHttpInterceptor for TestEmbedder {
+        async fn intercept(
+            &self,
+            request: spin_factor_outbound_http::intercept::InterceptRequest,
+        ) -> wasmtime_wasi_http::p2::HttpResult<
+            spin_factor_outbound_http::intercept::InterceptOutcome,
+        > {
+            use spin_factor_outbound_http::intercept::InterceptOutcome;
+            self.0.lock().unwrap().push((
+                request.uri().to_string(),
+                request
+                    .headers()
+                    .get("x-test-instance-invocation")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .into(),
+            ));
+            match request.uri().path() {
+                "/complete" => Ok(InterceptOutcome::Complete(
+                    http::Response::builder()
+                        .status(200)
+                        .body(request.into_hyper_request().into_body())
+                        .unwrap(),
+                )),
+                "/error" => Err(wasmtime_wasi_http::p2::HttpError::trap(
+                    std::io::Error::other("test embedder error"),
+                )),
+                _ => Ok(InterceptOutcome::Continue(request)),
+            }
+        }
+    }
+
+    fn check_embedder(testcase: &'static str, p3: bool) -> anyhow::Result<()> {
+        use test_environment::TestEnvironment;
+        use testing_framework::runtimes::in_process_spin::InProcessSpin;
+
+        let interceptor = std::sync::Arc::new(TestEmbedder(Default::default()));
+        let config = InProcessSpin::config_with_interceptor(
+            ServicesConfig::none(),
+            Some(interceptor.clone()),
+            move |env| super::testcases::preboot(testcase, env),
+        );
+        let mut env = TestEnvironment::up(config, |_| Ok(()))?;
+        let runtime = env.runtime_mut();
+        let body = b"streamed through the embedder";
+        let send = |runtime: &InProcessSpin, url| {
+            runtime.make_http_request(Request::full(
+                Method::Post,
+                "/double-echo",
+                &[("Host", "localhost"), ("url", url)],
+                Some(body.as_slice()),
+            ))
+        };
+        for _ in 0..2 {
+            let response = send(runtime, "http://embedder.invalid/complete")?;
+            assert_eq!((response.status(), response.body()), (200, body.to_vec()));
+        }
+        assert_eq!(
+            send(runtime, "http://embedder.invalid/continue")?.status(),
+            500
+        );
+        assert_eq!(
+            send(runtime, "http://embedder.invalid/error")?.status(),
+            500
+        );
+        assert_eq!(send(runtime, "http://one.spin.internal/echo")?.body(), body);
+
+        let calls = interceptor.0.lock().unwrap();
+        assert!(!calls.iter().any(|(uri, _)| uri.contains(".spin.internal")));
+        if p3 {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(uri, _)| uri.ends_with("/complete"))
+                    .map(|(_, invocation)| invocation.as_str())
+                    .collect::<Vec<_>>(),
+                ["1", "2"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn embedder_outbound_http_p2_and_p3_reuse() -> anyhow::Result<()> {
+        check_embedder("wasi-http-p2-streaming", false)?;
+        check_embedder("wasi-http-p3-streaming", true)
+    }
+
     #[cfg(feature = "extern-dependencies-tests")]
     /// Helper macro to assert that a condition is true eventually
     macro_rules! assert_eventually {

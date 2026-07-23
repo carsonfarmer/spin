@@ -17,13 +17,17 @@ use {
             },
         },
     },
-    core::mem,
+    core::{
+        mem,
+        sync::atomic::{AtomicU64, Ordering},
+    },
     futures::{stream, StreamExt},
     url::Url,
     wit_bindgen::{rt::async_support, StreamResult},
 };
 
 const MAX_CONCURRENCY: usize = 16;
+static INVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 struct Component;
 
@@ -31,6 +35,7 @@ export!(Component);
 
 impl Guest for Component {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
+        let invocation = INVOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
         let headers = request.get_headers().copy_all();
 
         Ok(
@@ -131,8 +136,12 @@ impl Guest for Component {
                         let method = request.get_method();
                         let (rx, trailers) =
                             Request::consume_body(request, wit_future::new(|| Ok(())).1);
-                        let outgoing_request =
-                            Request::new(Fields::new(), Some(rx), trailers, None).0;
+                        let fields = Fields::from_list(&[(
+                            "x-test-instance-invocation".into(),
+                            invocation.to_string().into_bytes(),
+                        )])
+                        .unwrap();
+                        let outgoing_request = Request::new(fields, Some(rx), trailers, None).0;
                         outgoing_request.set_method(&method).unwrap();
                         outgoing_request
                             .set_path_with_query(Some(url.path()))

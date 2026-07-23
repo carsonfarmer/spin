@@ -28,6 +28,7 @@ use rand::{
 };
 use serde::Deserialize;
 use spin_app::App;
+use spin_factor_outbound_http::intercept::OutboundHttpInterceptor;
 use spin_factors::RuntimeFactors;
 use spin_trigger::Trigger;
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -269,6 +270,7 @@ pub struct HttpTrigger {
     http1_max_buf_size: Option<usize>,
     reuse_config: InstanceReuseConfig,
     output_format: OutputFormat,
+    embedder_outbound_http_interceptor: Option<Arc<dyn OutboundHttpInterceptor>>,
 }
 
 impl<F: RuntimeFactors> Trigger<F> for HttpTrigger {
@@ -342,7 +344,24 @@ impl HttpTrigger {
             http1_max_buf_size,
             reuse_config,
             output_format,
+            embedder_outbound_http_interceptor: None,
         })
+    }
+
+    /// Installs an embedder-provided outbound HTTP interceptor.
+    ///
+    /// Spin service chaining runs before this interceptor, and ordinary network
+    /// handling runs after it returns `Continue`.
+    pub fn with_embedder_outbound_http_interceptor(
+        mut self,
+        interceptor: Arc<dyn OutboundHttpInterceptor>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.embedder_outbound_http_interceptor.is_none(),
+            "embedder outbound HTTP interceptor is already set"
+        );
+        self.embedder_outbound_http_interceptor = Some(interceptor);
+        Ok(self)
     }
 
     /// Turn this [`HttpTrigger`] into an [`HttpServer`].
@@ -357,8 +376,9 @@ impl HttpTrigger {
             http1_max_buf_size,
             reuse_config,
             output_format,
+            embedder_outbound_http_interceptor,
         } = self;
-        let server = Arc::new(HttpServer::new(
+        let server = Arc::new(HttpServer::new_with_embedder_outbound_http_interceptor(
             listen_addr,
             tls_config,
             find_free_port,
@@ -366,6 +386,7 @@ impl HttpTrigger {
             http1_max_buf_size,
             reuse_config,
             output_format,
+            embedder_outbound_http_interceptor,
         )?);
         Ok(server)
     }
