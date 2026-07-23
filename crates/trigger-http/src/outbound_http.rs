@@ -17,11 +17,15 @@ use crate::HttpServer;
 /// An outbound HTTP interceptor that handles service chaining requests.
 pub struct OutboundHttpInterceptor<F: RuntimeFactors> {
     server: Arc<HttpServer<F>>,
+    embedder: Option<Arc<dyn intercept::OutboundHttpInterceptor>>,
 }
 
 impl<F: RuntimeFactors> OutboundHttpInterceptor<F> {
-    pub fn new(server: Arc<HttpServer<F>>) -> Self {
-        Self { server }
+    pub fn new(
+        server: Arc<HttpServer<F>>,
+        embedder: Option<Arc<dyn intercept::OutboundHttpInterceptor>>,
+    ) -> Self {
+        Self { server, embedder }
     }
 }
 
@@ -42,6 +46,8 @@ impl<F: RuntimeFactors> intercept::OutboundHttpInterceptor for OutboundHttpInter
                 .to_wasmtime_result()
                 .map_err(HttpError::trap)?;
             Ok(InterceptOutcome::Complete(resp))
+        } else if let Some(embedder) = &self.embedder {
+            embedder.intercept(request).await
         } else {
             Ok(InterceptOutcome::Continue(request))
         }
