@@ -1,6 +1,6 @@
 //! The Spin runtime running in the same process as the test
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Context as _;
 use spin_factor_outbound_http::intercept::OutboundHttpInterceptor;
@@ -74,6 +74,10 @@ impl InProcessSpin {
                 .to_vec();
             Ok(Response::full(status, headers, chunks))
         })
+    }
+
+    pub fn server_weak(&self) -> Weak<HttpServer<TriggerFactors>> {
+        Arc::downgrade(&self.server)
     }
 
     async fn handle_http_request(

@@ -97,6 +97,7 @@ mod integration_tests {
         );
         let mut env = TestEnvironment::up(config, |_| Ok(()))?;
         let runtime = env.runtime_mut();
+        let server = p3.then(|| runtime.server_weak());
         let body = b"streamed through the embedder";
         let send = |runtime: &InProcessSpin, url| {
             runtime.make_http_request(Request::full(
@@ -154,6 +155,11 @@ mod integration_tests {
                     .collect::<Vec<_>>(),
                 ["1", "2"]
             );
+        }
+        drop(calls);
+        drop(env);
+        if let Some(server) = server {
+            assert!(server.upgrade().is_none());
         }
         Ok(())
     }

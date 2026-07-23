@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io::{ErrorKind, IsTerminal},
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     time::Duration,
 };
 
@@ -707,13 +707,13 @@ pub(crate) trait HttpExecutor {
 pub(crate) struct HttpHandlerState<F: RuntimeFactors> {
     component_id: String,
     reuse_config: InstanceReuseConfig,
-    server: OnceLock<Arc<HttpServer<F>>>,
+    server: OnceLock<Weak<HttpServer<F>>>,
     self_scheme: OnceLock<Scheme>,
 }
 
 impl<F: RuntimeFactors> HttpHandlerState<F> {
     pub(crate) fn init_once(&self, server: &Arc<HttpServer<F>>, self_scheme: &Scheme) {
-        self.server.get_or_init(|| server.clone());
+        self.server.get_or_init(|| Arc::downgrade(server));
         self.self_scheme.get_or_init(|| self_scheme.clone());
     }
 }
@@ -727,6 +727,8 @@ impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
                 .server
                 .get()
                 .expect("server should be initialized")
+                .upgrade()
+                .expect("server should still be available")
                 .trigger_instance_builder(
                     &self.component_id,
                     self.self_scheme
