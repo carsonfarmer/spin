@@ -83,9 +83,17 @@ mod integration_tests {
             500
         );
         assert_eq!(send(runtime, "http://one.spin.internal/echo")?.body(), body);
+        assert_eq!(
+            send(runtime, "http://denied.invalid/complete")?.status(),
+            500
+        );
 
         let calls = interceptor.0.lock().unwrap();
-        assert!(!calls.iter().any(|(uri, _)| uri.contains(".spin.internal")));
+        assert!(
+            !calls
+                .iter()
+                .any(|(uri, _)| uri.contains(".spin.internal") || uri.contains("denied.invalid"))
+        );
         if p3 {
             assert_eq!(
                 calls

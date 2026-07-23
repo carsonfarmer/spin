@@ -93,28 +93,6 @@ impl<F: RuntimeFactors> HttpServer<F> {
         reuse_config: InstanceReuseConfig,
         output_format: OutputFormat,
     ) -> anyhow::Result<Self> {
-        Self::new_with_embedder_outbound_http_interceptor(
-            listen_addr,
-            tls_config,
-            find_free_port,
-            trigger_app,
-            http1_max_buf_size,
-            reuse_config,
-            output_format,
-            None,
-        )
-    }
-
-    pub(crate) fn new_with_embedder_outbound_http_interceptor(
-        listen_addr: SocketAddr,
-        tls_config: Option<TlsConfig>,
-        find_free_port: bool,
-        trigger_app: TriggerApp<F>,
-        http1_max_buf_size: Option<usize>,
-        reuse_config: InstanceReuseConfig,
-        output_format: OutputFormat,
-        embedder_outbound_http_interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
-    ) -> anyhow::Result<Self> {
         // This needs to be a vec before building the router to handle duplicate routes
         let component_trigger_configs = trigger_app
             .app()
@@ -183,8 +161,16 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_trigger_configs,
             component_handler_types,
             output_format,
-            embedder_outbound_http_interceptor,
+            embedder_outbound_http_interceptor: None,
         })
+    }
+
+    pub(crate) fn with_embedder_outbound_http_interceptor(
+        mut self,
+        interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
+    ) -> Self {
+        self.embedder_outbound_http_interceptor = interceptor;
+        self
     }
 
     fn handler_type_for_component(

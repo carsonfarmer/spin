@@ -378,16 +378,18 @@ impl HttpTrigger {
             output_format,
             embedder_outbound_http_interceptor,
         } = self;
-        let server = Arc::new(HttpServer::new_with_embedder_outbound_http_interceptor(
-            listen_addr,
-            tls_config,
-            find_free_port,
-            trigger_app,
-            http1_max_buf_size,
-            reuse_config,
-            output_format,
-            embedder_outbound_http_interceptor,
-        )?);
+        let server = Arc::new(
+            HttpServer::new(
+                listen_addr,
+                tls_config,
+                find_free_port,
+                trigger_app,
+                http1_max_buf_size,
+                reuse_config,
+                output_format,
+            )?
+            .with_embedder_outbound_http_interceptor(embedder_outbound_http_interceptor),
+        );
         Ok(server)
     }
 
