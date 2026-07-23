@@ -26,6 +26,7 @@ use hyper_util::{
 use pin_project_lite::pin_project;
 use rand::RngExt;
 use spin_app::{APP_DESCRIPTION_KEY, APP_NAME_KEY};
+use spin_factor_outbound_http::intercept::OutboundHttpInterceptor as EmbedderOutboundHttpInterceptor;
 use spin_factor_outbound_http::{OutboundHttpFactor, SelfRequestOrigin};
 use spin_factors::RuntimeFactors;
 use spin_factors_executor::InstanceState;
@@ -102,6 +103,7 @@ pub struct HttpServer<F: RuntimeFactors> {
     component_trigger_configs: HashMap<spin_http::routes::TriggerLookupKey, HttpTriggerConfig>,
     // Component ID -> handler type
     component_handler_types: HashMap<String, HandlerType<HttpHandlerState<F>>>,
+    embedder_outbound_http_interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
 }
 
 impl<F: RuntimeFactors> HttpServer<F> {
@@ -185,7 +187,16 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_handler_types,
             output_format,
             request_deadline: reuse_config.request_deadline,
+            embedder_outbound_http_interceptor: None,
         })
+    }
+
+    pub(crate) fn with_embedder_outbound_http_interceptor(
+        mut self,
+        interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
+    ) -> Self {
+        self.embedder_outbound_http_interceptor = interceptor;
+        self
     }
 
     fn handler_type_for_component(
@@ -483,7 +494,10 @@ impl<F: RuntimeFactors> HttpServer<F> {
         let self_addr = self.get_local_addr();
         let origin = SelfRequestOrigin::create(self_scheme, &self_addr.to_string())?;
         outbound_http.set_self_request_origin(origin);
-        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(self.clone()))?;
+        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(
+            self.clone(),
+            self.embedder_outbound_http_interceptor.clone(),
+        ))?;
         Ok(instance_builder)
     }
 

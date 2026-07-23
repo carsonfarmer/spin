@@ -13,6 +13,7 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 test-environment = { workspace = true }
 spin-app = { path = "../../crates/app" }
+spin-factor-outbound-http = { path = "../../crates/factor-outbound-http" }
 spin-http = { path = "../../crates/http" }
 spin-loader = { path = "../../crates/loader" }
 spin-runtime-factors = { path = "../../crates/runtime-factors" }
