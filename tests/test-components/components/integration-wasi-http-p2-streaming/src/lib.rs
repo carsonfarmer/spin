@@ -141,6 +141,32 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
             }
         }
 
+        (Method::Post, Some("/cancel-outbound")) => {
+            if let Some(url) = headers.iter().find_map(|(k, v)| {
+                (k == "url")
+                    .then_some(v)
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|v| Url::parse(v).ok())
+            }) {
+                let request = OutgoingRequest::new(
+                    &Method::Get,
+                    Some(url.path()),
+                    Some(&Scheme::Http),
+                    Some(url.authority()),
+                    &Headers::new(&[]),
+                );
+                match http::send::<_, IncomingResponse>(request).await {
+                    Ok(response) => {
+                        drop(response);
+                        respond(204, response_out);
+                    }
+                    Err(_) => server_error(response_out),
+                }
+            } else {
+                bad_request(response_out);
+            }
+        }
+
         _ => method_not_allowed(response_out),
     }
 }

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use spin_factor_outbound_http::intercept::OutboundHttpInterceptor;
 use spin_runtime_factors::{FactorsBuilder, TriggerAppArgs, TriggerFactors};
 use spin_trigger::{cli::TriggerAppBuilder, loader::ComponentLoader};
 use spin_trigger_http::{HttpServer, HttpTrigger, InstanceReuseConfig, OutputFormat};
@@ -16,6 +17,7 @@ use test_environment::{
 ///
 /// Use `runtimes::spin_cli::SpinCli` if you'd rather use Spin as a separate process
 pub struct InProcessSpin {
+    runtime: tokio::runtime::Runtime,
     server: Arc<HttpServer<TriggerFactors>>,
 }
 
@@ -25,43 +27,32 @@ impl InProcessSpin {
         services_config: ServicesConfig,
         preboot: impl FnOnce(&mut TestEnvironment<InProcessSpin>) -> anyhow::Result<()> + 'static,
     ) -> TestEnvironmentConfig<Self> {
+        Self::config_with_interceptor(services_config, None, preboot)
+    }
+
+    /// Configure an in-process Spin instance with an embedder HTTP interceptor.
+    pub fn config_with_interceptor(
+        services_config: ServicesConfig,
+        interceptor: Option<Arc<dyn OutboundHttpInterceptor>>,
+        preboot: impl FnOnce(&mut TestEnvironment<InProcessSpin>) -> anyhow::Result<()> + 'static,
+    ) -> TestEnvironmentConfig<Self> {
         TestEnvironmentConfig {
             services_config,
-            create_runtime: Box::new(|env| {
+            create_runtime: Box::new(move |env| {
                 preboot(env)?;
-                tokio::runtime::Runtime::new()
-                    .context("failed to start tokio runtime")?
-                    .block_on(async { initialize_trigger(env).await })
+                let runtime =
+                    tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
+                let server =
+                    runtime.block_on(async { initialize_trigger(env, interceptor).await })?;
+                Ok(Self { runtime, server })
             }),
         }
     }
 
-    /// Create a new instance of Spin running in the same process as the tests
-    pub fn new(server: Arc<HttpServer<TriggerFactors>>) -> Self {
-        Self { server }
-    }
-
     /// Make an HTTP request to the Spin instance
     pub fn make_http_request(&self, req: Request<'_, &[u8]>) -> anyhow::Result<Response> {
-        tokio::runtime::Runtime::new()?.block_on(async {
-            let method: reqwest::Method = req.method.into();
-            let mut builder = http::request::Request::builder()
-                .method(method)
-                .uri(req.path);
-
-            for (key, value) in req.headers {
-                builder = builder.header(*key, *value);
-            }
-            // TODO(rylev): convert body as well
-            let req = builder.body(spin_http::body::empty()).unwrap();
-            let response = self
-                .server
-                .handle(
-                    req,
-                    http::uri::Scheme::HTTP,
-                    (std::net::Ipv4Addr::LOCALHOST, 7000).into(),
-                )
-                .await?;
+        self.runtime.block_on(async {
+            let response = self.handle_http_request(req).await?;
             use http_body_util::BodyExt;
             let status = response.status().as_u16();
             let headers = response
@@ -84,6 +75,29 @@ impl InProcessSpin {
             Ok(Response::full(status, headers, chunks))
         })
     }
+
+    async fn handle_http_request(
+        &self,
+        req: Request<'_, &[u8]>,
+    ) -> anyhow::Result<http::Response<spin_http::Body>> {
+        let method: reqwest::Method = req.method.into();
+        let mut builder = http::request::Request::builder()
+            .method(method)
+            .uri(req.path);
+        for (key, value) in req.headers {
+            builder = builder.header(*key, *value);
+        }
+        let body = req.body.map_or_else(spin_http::body::empty, |body| {
+            spin_http::body::full(body.to_vec().into())
+        });
+        self.server
+            .handle(
+                builder.body(body)?,
+                http::uri::Scheme::HTTP,
+                (std::net::Ipv4Addr::LOCALHOST, 7000).into(),
+            )
+            .await
+    }
 }
 
 impl Runtime for InProcessSpin {
@@ -95,7 +109,8 @@ impl Runtime for InProcessSpin {
 /// Initialize the trigger for the Spin instance inside the environment
 async fn initialize_trigger(
     env: &mut TestEnvironment<InProcessSpin>,
-) -> anyhow::Result<InProcessSpin> {
+    interceptor: Option<Arc<dyn OutboundHttpInterceptor>>,
+) -> anyhow::Result<Arc<HttpServer<TriggerFactors>>> {
     let locked_app = spin_loader::from_file(
         env.path().join("spin.toml"),
         spin_loader::FilesMountStrategy::Direct,
@@ -105,7 +120,7 @@ async fn initialize_trigger(
     .await?;
 
     let app = spin_app::App::new("my-app", locked_app);
-    let trigger = HttpTrigger::new(
+    let mut trigger = HttpTrigger::new(
         &app,
         "127.0.0.1:80".parse().unwrap(),
         None,
@@ -114,6 +129,9 @@ async fn initialize_trigger(
         InstanceReuseConfig::default(),
         OutputFormat::default(),
     )?;
+    if let Some(interceptor) = interceptor {
+        trigger = trigger.with_embedder_outbound_http_interceptor(interceptor)?;
+    }
     let mut builder = TriggerAppBuilder::<_, FactorsBuilder>::new(trigger);
     let trigger_app = builder
         .build(
@@ -125,5 +143,5 @@ async fn initialize_trigger(
         .await?;
     let server = builder.trigger.into_server(trigger_app)?;
 
-    Ok(InProcessSpin::new(server))
+    Ok(server)
 }

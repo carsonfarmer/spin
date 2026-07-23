@@ -17,13 +17,17 @@ use {
             },
         },
     },
-    core::mem,
+    core::{
+        mem,
+        sync::atomic::{AtomicU64, Ordering},
+    },
     futures::{stream, StreamExt},
     url::Url,
     wit_bindgen::{rt::async_support, StreamResult},
 };
 
 const MAX_CONCURRENCY: usize = 16;
+static INVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 struct Component;
 
@@ -32,6 +36,7 @@ export!(Component);
 impl Guest for Component {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
         let headers = request.get_headers().copy_all();
+        let invocation = INVOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
 
         Ok(
             match (
@@ -131,8 +136,17 @@ impl Guest for Component {
                         let method = request.get_method();
                         let (rx, trailers) =
                             Request::consume_body(request, wit_future::new(|| Ok(())).1);
-                        let outgoing_request =
-                            Request::new(Fields::new(), Some(rx), trailers, None).0;
+                        let outgoing_request = Request::new(
+                            Fields::from_list(&[(
+                                "x-test-instance-invocation".into(),
+                                invocation.to_string().into_bytes(),
+                            )])
+                            .unwrap(),
+                            Some(rx),
+                            trailers,
+                            None,
+                        )
+                        .0;
                         outgoing_request.set_method(&method).unwrap();
                         outgoing_request
                             .set_path_with_query(Some(url.path()))
@@ -148,6 +162,39 @@ impl Guest for Component {
                             .set_authority(Some(url.authority()))
                             .unwrap();
                         client::send(outgoing_request).await?
+                    } else {
+                        bad_request()
+                    }
+                }
+
+                (Method::Post, Some("/cancel-outbound")) => {
+                    if let Some(url) = headers.iter().find_map(|(k, v)| {
+                        (k == "url")
+                            .then_some(v)
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .and_then(|v| Url::parse(v).ok())
+                    }) {
+                        let outgoing_request = Request::new(
+                            Fields::from_list(&[(
+                                "x-test-instance-invocation".into(),
+                                invocation.to_string().into_bytes(),
+                            )])
+                            .unwrap(),
+                            None,
+                            wit_future::new(|| Ok(None)).1,
+                            None,
+                        )
+                        .0;
+                        outgoing_request.set_method(&Method::Get).unwrap();
+                        outgoing_request
+                            .set_path_with_query(Some(url.path()))
+                            .unwrap();
+                        outgoing_request.set_scheme(Some(&Scheme::Http)).unwrap();
+                        outgoing_request
+                            .set_authority(Some(url.authority()))
+                            .unwrap();
+                        drop(client::send(outgoing_request).await?);
+                        respond(204)
                     } else {
                         bad_request()
                     }

@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io::{ErrorKind, IsTerminal},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -23,6 +23,7 @@ use hyper_util::{
 };
 use rand::Rng;
 use spin_app::{APP_DESCRIPTION_KEY, APP_NAME_KEY};
+use spin_factor_outbound_http::intercept::OutboundHttpInterceptor as EmbedderOutboundHttpInterceptor;
 use spin_factor_outbound_http::{OutboundHttpFactor, SelfRequestOrigin};
 use spin_factors::RuntimeFactors;
 use spin_factors_executor::InstanceState;
@@ -78,6 +79,7 @@ pub struct HttpServer<F: RuntimeFactors> {
     component_trigger_configs: HashMap<spin_http::routes::TriggerLookupKey, HttpTriggerConfig>,
     // Component ID -> handler type
     component_handler_types: HashMap<String, HandlerType<HttpHandlerState<F>>>,
+    embedder_outbound_http_interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
 }
 
 impl<F: RuntimeFactors> HttpServer<F> {
@@ -159,7 +161,16 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_trigger_configs,
             component_handler_types,
             output_format,
+            embedder_outbound_http_interceptor: None,
         })
+    }
+
+    pub(crate) fn with_embedder_outbound_http_interceptor(
+        mut self,
+        interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
+    ) -> Self {
+        self.embedder_outbound_http_interceptor = interceptor;
+        self
     }
 
     fn handler_type_for_component(
@@ -173,9 +184,10 @@ impl<F: RuntimeFactors> HttpServer<F> {
             None | Some(HttpExecutorType::Http) => HandlerType::from_instance_pre(
                 pre,
                 HttpHandlerState {
-                    trigger_app: trigger_app.clone(),
                     component_id: component_id.into(),
                     reuse_config,
+                    server: OnceLock::new(),
+                    self_scheme: OnceLock::new(),
                 },
             )?,
             Some(HttpExecutorType::Wagi(wagi_config)) => {
@@ -375,20 +387,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
         component_id: &str,
         executor: &Option<HttpExecutorType>,
     ) -> anyhow::Result<Response<Body>> {
-        let mut instance_builder = self.trigger_app.prepare(component_id)?;
-
-        // Set up outbound HTTP request origin and service chaining
-        // The outbound HTTP factor is required since both inbound and outbound wasi HTTP
-        // implementations assume they use the same underlying wasmtime resource storage.
-        // Eventually, we may be able to factor this out to a separate factor.
-        let outbound_http = instance_builder
-            .factor_builder::<OutboundHttpFactor>()
-            .context(
-            "The wasi HTTP trigger was configured without the required wasi outbound http support",
-        )?;
-        let origin = SelfRequestOrigin::create(server_scheme, &self.listen_addr.to_string())?;
-        outbound_http.set_self_request_origin(origin);
-        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(self.clone()))?;
+        let instance_builder = self.trigger_instance_builder(component_id, &server_scheme)?;
 
         // Prepare HTTP executor
         let handler_type = self
@@ -406,7 +405,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
                 }
                 HandlerType::Wasi0_3(_, handler) => {
                     Wasip3HttpExecutor(handler)
-                        .execute(&route_match, req, client_addr)
+                        .execute(self, &server_scheme, &route_match, req, client_addr)
                         .await
                 }
                 HandlerType::Wasi0_2(_)
@@ -443,6 +442,27 @@ impl<F: RuntimeFactors> HttpServer<F> {
                 Self::internal_error(None, route_match.raw_route())
             }
         }
+    }
+
+    fn trigger_instance_builder(
+        self: &'_ Arc<Self>,
+        component_id: &str,
+        server_scheme: &Scheme,
+    ) -> anyhow::Result<TriggerInstanceBuilder<'_, F>> {
+        let mut instance_builder = self.trigger_app.prepare(component_id)?;
+        let outbound_http = instance_builder
+            .factor_builder::<OutboundHttpFactor>()
+            .context(
+            "The wasi HTTP trigger was configured without the required wasi outbound http support",
+        )?;
+        let origin =
+            SelfRequestOrigin::create(server_scheme.clone(), &self.listen_addr.to_string())?;
+        outbound_http.set_self_request_origin(origin);
+        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(
+            self.clone(),
+            self.embedder_outbound_http_interceptor.clone(),
+        ))?;
+        Ok(instance_builder)
     }
 
     fn respond_static_response(
@@ -685,9 +705,17 @@ pub(crate) trait HttpExecutor {
 }
 
 pub(crate) struct HttpHandlerState<F: RuntimeFactors> {
-    trigger_app: Arc<TriggerApp<F>>,
     component_id: String,
     reuse_config: InstanceReuseConfig,
+    server: OnceLock<Arc<HttpServer<F>>>,
+    self_scheme: OnceLock<Scheme>,
+}
+
+impl<F: RuntimeFactors> HttpHandlerState<F> {
+    pub(crate) fn init_once(&self, server: &Arc<HttpServer<F>>, self_scheme: &Scheme) {
+        self.server.get_or_init(|| server.clone());
+        self.self_scheme.get_or_init(|| self_scheme.clone());
+    }
 }
 
 impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
@@ -696,8 +724,15 @@ impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
     fn new_store(&self, _req_id: Option<u64>) -> wasmtime::Result<StoreBundle<Self::StoreData>> {
         Ok(StoreBundle {
             store: self
-                .trigger_app
-                .prepare(&self.component_id)
+                .server
+                .get()
+                .expect("server should be initialized")
+                .trigger_instance_builder(
+                    &self.component_id,
+                    self.self_scheme
+                        .get()
+                        .expect("server scheme should be initialized"),
+                )
                 .to_wasmtime_result()?
                 .instantiate_store(())
                 .to_wasmtime_result()?
