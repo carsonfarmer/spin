@@ -468,7 +468,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
             Err(err) => {
                 tracing::error!("Error processing request: {err:?}");
                 instrument_error(&err);
-                Self::internal_error(None, route_match.raw_route())
+                Self::execution_error(&err, route_match.raw_route())
             }
         }
     }
@@ -531,20 +531,15 @@ impl<F: RuntimeFactors> HttpServer<F> {
         ))
     }
 
-    /// Creates an HTTP 500 response.
-    fn internal_error(
-        body: Option<&str>,
+    /// Creates a classified HTTP response for a guest execution error.
+    fn execution_error(
+        error: &anyhow::Error,
         route: impl Into<String>,
     ) -> anyhow::Result<Response<Body>> {
-        let body = match body {
-            Some(body) => body::full(Bytes::copy_from_slice(body.as_bytes())),
-            None => body::empty(),
-        };
-
         Ok(MatchedRoute::with_response_extension(
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(body)?,
+                .status(execution_error_status(error))
+                .body(body::empty())?,
             route,
         ))
     }
@@ -688,6 +683,24 @@ impl<F: RuntimeFactors> HttpServer<F> {
 
     pub(crate) fn request_deadline(&self) -> Option<Duration> {
         self.request_deadline
+    }
+}
+
+fn execution_error_status(error: &anyhow::Error) -> StatusCode {
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_fuel_is_a_gateway_timeout() {
+        let error = anyhow::Error::new(wasmtime::Trap::OutOfFuel);
+        assert_eq!(execution_error_status(&error), StatusCode::GATEWAY_TIMEOUT);
     }
 }
 
