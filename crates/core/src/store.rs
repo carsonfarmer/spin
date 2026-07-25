@@ -88,6 +88,7 @@ pub struct StoreBuilder {
     engine: WasmtimeEngine,
     epoch_tick_interval: Duration,
     store_limits: StoreLimitsAsync,
+    initial_fuel: Option<u64>,
 }
 
 impl StoreBuilder {
@@ -97,6 +98,7 @@ impl StoreBuilder {
             engine,
             epoch_tick_interval,
             store_limits: StoreLimitsAsync::default(),
+            initial_fuel: None,
         }
     }
 
@@ -108,6 +110,13 @@ impl StoreBuilder {
         self.store_limits = StoreLimitsAsync::new(Some(max_memory_size), None);
     }
 
+    /// Sets the initial Wasmtime fuel available to the store.
+    ///
+    /// Fuel consumption must be enabled on the engine configuration.
+    pub fn initial_fuel(&mut self, initial_fuel: u64) {
+        self.initial_fuel = Some(initial_fuel);
+    }
+
     /// Builds a [`Store`] from this builder with given host state data.
     ///
     /// The `T` parameter must provide access to a [`State`] via `impl
@@ -117,6 +126,9 @@ impl StoreBuilder {
 
         let mut inner = wasmtime::Store::new(&self.engine, data);
         inner.limiter_async(|data| &mut data.as_state().store_limits);
+        if let Some(initial_fuel) = self.initial_fuel {
+            inner.set_fuel(initial_fuel)?;
+        }
 
         // With epoch interruption enabled, there must be _some_ deadline set
         // or execution will trap immediately. Since this is a delta, we need
