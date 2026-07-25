@@ -1467,13 +1467,31 @@ mod test {
         assert_eq!(layers.len(), 2);
 
         let encoded = serde_json::to_vec(&locked).unwrap();
-        let round_trip: LockedApp = serde_json::from_slice(&encoded).unwrap();
+        let mut round_trip: LockedApp = serde_json::from_slice(&encoded).unwrap();
         let content = &round_trip.components[0].trigger_dependencies["middleware"][0]
             .source
             .content;
         assert!(content.source.is_none());
-        let digest = content.digest.as_ref().unwrap();
-        assert!(layers.iter().any(|layer| layer.sha256_digest() == *digest));
+        let digest = content.digest.as_ref().unwrap().clone();
+        assert!(layers.iter().any(|layer| layer.sha256_digest() == digest));
+
+        for layer in &layers {
+            client
+                .cache
+                .write_wasm(&layer.data, layer.sha256_digest())
+                .await
+                .unwrap();
+        }
+        crate::OciLoader::new(working_dir.path())
+            .resolve_component_content_refs(&mut round_trip.components[0], &client.cache)
+            .await
+            .unwrap();
+        let content = &round_trip.components[0].trigger_dependencies["middleware"][0]
+            .source
+            .content;
+        assert!(content.digest.is_none());
+        let path = parse_file_url(content.source.as_deref().unwrap()).unwrap();
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"middleware");
     }
 
     fn generate_dummy_component(wit: &str, world: &str) -> Vec<u8> {
