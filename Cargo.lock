@@ -6212,7 +6212,7 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.17.0"
-source = "git+https://github.com/oras-project/rust-oci-client?rev=49c409df9a544f2d02ae4ae6a5fd8510ec74f438#49c409df9a544f2d02ae4ae6a5fd8510ec74f438"
+source = "git+https://github.com/carsonfarmer/rust-oci-client?rev=e17e1c6258a369ad7cc926735f9cce53d25caac8#e17e1c6258a369ad7cc926735f9cce53d25caac8"
 dependencies = [
  "bytes",
  "chrono",
