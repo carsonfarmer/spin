@@ -242,6 +242,8 @@ pub struct InstanceReuseConfig {
     request_timeout: Option<Range<Duration>>,
     request_deadline: Option<Duration>,
     idle_instance_timeout: Range<Duration>,
+    initial_fuel: Option<u64>,
+    fuel_async_yield_interval: Option<u64>,
 }
 
 impl Default for InstanceReuseConfig {
@@ -254,6 +256,8 @@ impl Default for InstanceReuseConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             request_deadline: None,
             idle_instance_timeout: DEFAULT_IDLE_INSTANCE_TIMEOUT,
+            initial_fuel: None,
+            fuel_async_yield_interval: None,
         }
     }
 }
@@ -273,7 +277,16 @@ impl InstanceReuseConfig {
             request_timeout: Some(Range::Value(timeout)),
             request_deadline: Some(timeout),
             idle_instance_timeout: DEFAULT_IDLE_INSTANCE_TIMEOUT,
+            initial_fuel: None,
+            fuel_async_yield_interval: None,
         }
+    }
+
+    /// Applies a fixed fuel budget and async-yield interval to each HTTP component store.
+    pub fn with_fuel(mut self, initial_fuel: u64, async_yield_interval: u64) -> Self {
+        self.initial_fuel = Some(initial_fuel);
+        self.fuel_async_yield_interval = Some(async_yield_interval);
+        self
     }
 }
 
@@ -314,6 +327,8 @@ impl<F: RuntimeFactors> Trigger<F> for HttpTrigger {
             request_timeout: cli_args.request_timeout,
             request_deadline: None,
             idle_instance_timeout: cli_args.idle_instance_timeout,
+            initial_fuel: None,
+            fuel_async_yield_interval: None,
         };
 
         Self::new(
@@ -503,5 +518,15 @@ mod tests {
         ));
         assert!(matches!(config.request_timeout, Some(Range::Value(value)) if value == timeout));
         assert_eq!(config.request_deadline, Some(timeout));
+        assert_eq!(config.initial_fuel, None);
+        assert_eq!(config.fuel_async_yield_interval, None);
+    }
+
+    #[test]
+    fn fuel_config_applies_to_each_fresh_store() {
+        let config = InstanceReuseConfig::default().with_fuel(1_000, 100);
+
+        assert_eq!(config.initial_fuel, Some(1_000));
+        assert_eq!(config.fuel_async_yield_interval, Some(100));
     }
 }

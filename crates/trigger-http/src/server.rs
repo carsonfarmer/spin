@@ -95,6 +95,10 @@ pub struct HttpServer<F: RuntimeFactors> {
     output_format: OutputFormat,
     /// Hard Wasmtime request deadline for direct HTTP executor paths.
     request_deadline: Option<Duration>,
+    /// Fuel applied to each component store after embedder hooks run.
+    initial_fuel: Option<u64>,
+    /// Fuel interval at which async component stores yield.
+    fuel_async_yield_interval: Option<u64>,
     /// Request router.
     router: Router,
     /// The app being triggered.
@@ -187,6 +191,8 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_handler_types,
             output_format,
             request_deadline: reuse_config.request_deadline,
+            initial_fuel: reuse_config.initial_fuel,
+            fuel_async_yield_interval: reuse_config.fuel_async_yield_interval,
             embedder_outbound_http_interceptor: None,
         })
     }
@@ -479,6 +485,14 @@ impl<F: RuntimeFactors> HttpServer<F> {
         self_scheme: Option<&Scheme>,
     ) -> anyhow::Result<TriggerInstanceBuilder<'_, F>> {
         let mut instance_builder = self.trigger_app.prepare(component_id)?;
+        if let Some(initial_fuel) = self.initial_fuel {
+            instance_builder.store_builder().initial_fuel(initial_fuel);
+        }
+        if let Some(interval) = self.fuel_async_yield_interval {
+            instance_builder
+                .store_builder()
+                .fuel_async_yield_interval(interval);
+        }
 
         // Set up outbound HTTP request origin and service chaining
         // The outbound HTTP factor is required since both inbound and outbound wasi HTTP
