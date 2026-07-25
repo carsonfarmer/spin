@@ -417,7 +417,13 @@ impl RequestSender {
         let mut override_connect_addr = None;
         if let Some(interceptor) = &self.request_interceptor {
             let intercept_request = std::mem::take(&mut request).into();
-            match interceptor.intercept(intercept_request).await? {
+            match timeout(
+                config.first_byte_timeout,
+                interceptor.intercept(intercept_request),
+            )
+            .await
+            .map_err(|_| ErrorCode::ConnectionReadTimeout)??
+            {
                 InterceptOutcome::Continue(mut req) => {
                     override_connect_addr = req.override_connect_addr.take();
                     request = req.into_hyper_request();

@@ -143,6 +143,46 @@ async fn override_connect_addr_disallowed_private_ip_fails() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn p3_first_byte_timeout_applies_to_interceptor() -> anyhow::Result<()> {
+    let mut state = test_instance_state("https://*", true).await?;
+    state.http.set_request_interceptor({
+        struct Interceptor;
+        #[async_trait]
+        impl OutboundHttpInterceptor for Interceptor {
+            async fn intercept(
+                &self,
+                _request: InterceptRequest,
+            ) -> wasmtime_wasi_http::p2::HttpResult<InterceptOutcome> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let body = Empty::<Bytes>::new()
+                    .map_err(|never: std::convert::Infallible| match never {})
+                    .boxed_unsync();
+                Ok(InterceptOutcome::Complete(http::Response::new(body)))
+            }
+        }
+        Interceptor
+    })?;
+
+    let p3_view = OutboundHttpFactor::get_wasi_p3_http_impl(&mut state).unwrap();
+    let req = Request::get("https://example.test").body(empty_p3_body())?;
+    let result = Box::into_pin(p3_view.hooks.send_request(
+        req,
+        fast_p3_options(),
+        p3_noop_cleanup_fut(),
+    ))
+    .await;
+
+    let Err(error) = result else {
+        bail!("expected interceptor to exceed first-byte timeout")
+    };
+    assert_matches!(
+        error.downcast()?,
+        p3_types::ErrorCode::ConnectionReadTimeout
+    );
+    Ok(())
+}
+
 async fn test_instance_state(
     allowed_outbound_hosts: &str,
     allow_private_ips: bool,
