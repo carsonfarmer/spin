@@ -54,6 +54,7 @@ fn test_initial_fuel() {
     let engine = Engine::<State>::builder(&config).unwrap().build();
     let mut builder = engine.store_builder();
     builder.initial_fuel(123);
+    builder.fuel_async_yield_interval(10);
     let store = builder.build(State::default()).unwrap();
     assert_eq!(store.as_ref().get_fuel().unwrap(), 123);
 }
