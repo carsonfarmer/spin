@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use spin_common::{ui::quoted_path, url::parse_file_url};
 use spin_locked_app::locked::{LockedComponent, LockedComponentSource};
 
-/// Validate that all Spin components specify valid wasm binaries in both the `source`
-/// field and for each dependency.
+/// Validate that all Spin components specify valid wasm binaries in the `source`
+/// field and for every ordinary or trigger dependency.
 pub async fn ensure_wasms(component: &LockedComponent) -> Result<()> {
     // Ensure that the component source is a valid wasm binary.
     let bytes = read_component_source(&component.source).await?;
@@ -23,6 +23,18 @@ pub async fn ensure_wasms(component: &LockedComponent) -> Result<()> {
                 dep_name,
                 component.id,
             );
+        }
+    }
+    for (trigger, dependencies) in &component.trigger_dependencies {
+        for dependency in dependencies {
+            let bytes = read_component_source(&dependency.source).await?;
+            if !is_wasm_binary(&bytes) {
+                bail!(
+                    "trigger dependency {} for component {} is not a valid .wasm file",
+                    trigger,
+                    component.id,
+                );
+            }
         }
     }
     Ok(())
@@ -156,6 +168,28 @@ mod test {
             TestCase {
                 name: "Valid Spin component with invalid wasm dependency",
                 locked_component: make_locked!("component.wasm", "test:comp2" = "invalid.wasm"),
+                valid: false,
+            },
+            TestCase {
+                name: "Invalid Spin component with invalid trigger dependency",
+                locked_component: from_json!({
+                    "id": "jiggs",
+                    "source": {
+                        "content_type": "application/wasm",
+                        "source": file_url(working_dir.path().join("component.wasm")),
+                        "digest": "digest",
+                    },
+                    "trigger_dependencies": {
+                        "middleware": [{
+                            "source": {
+                                "content_type": "application/wasm",
+                                "source": file_url(working_dir.path().join("invalid.wasm")),
+                                "digest": "digest",
+                            },
+                            "export": null,
+                        }]
+                    }
+                }),
                 valid: false,
             },
         ];

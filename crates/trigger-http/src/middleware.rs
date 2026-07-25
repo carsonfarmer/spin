@@ -7,6 +7,12 @@ use spin_factors_executor::{
     TriggerDependenciesComposer, TriggerDependency, TriggerDependencyData,
 };
 
+const HANDLER_PREFIX: &str = "wasi:http/handler@";
+const HANDLER_INTERFACES: [&str; 2] = [
+    "wasi:http/handler@0.3.0",
+    "wasi:http/handler@0.3.0-rc-2026-03-15",
+];
+
 #[derive(Default)]
 pub(crate) struct HttpMiddlewareComposer;
 
@@ -76,28 +82,37 @@ fn chain(
     Ok(upstream_handle)
 }
 
+fn handler_interfaces<'a>(names: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+    names
+        .map(String::as_str)
+        .filter(|name| name.starts_with(HANDLER_PREFIX))
+        .collect()
+}
+
+fn select_handler<'a>(names: impl Iterator<Item = &'a String>) -> anyhow::Result<&'a str> {
+    let handlers = handler_interfaces(names);
+    let [handler] = handlers.as_slice() else {
+        bail!("component must expose exactly one wasi:http handler interface");
+    };
+    if !HANDLER_INTERFACES.contains(handler) {
+        bail!("unsupported wasi:http handler interface `{handler}`");
+    }
+    Ok(handler)
+}
+
 async fn compose_middlewares(
     primary: Vec<u8>,
     middleware_blobs: &[TriggerDependency],
 ) -> anyhow::Result<Vec<u8>> {
     use spin_compose::DependencyLike;
 
-    const HANDLER_INTERFACES: [&str; 2] = [
-        "wasi:http/handler@0.3.0",
-        "wasi:http/handler@0.3.0-rc-2026-03-15",
-    ];
-
     let mut graph = CompositionGraph::new();
     let mut package_ids: Vec<PackageId> = Vec::new();
     let primary = Package::from_bytes("primary", None, primary, graph.types_mut())
         .context("parsing primary component")?;
-    let handlers = HANDLER_INTERFACES
-        .into_iter()
-        .filter(|name| graph.types()[primary.ty()].exports.contains_key(*name))
-        .collect::<Vec<_>>();
-    let [handler] = handlers.as_slice() else {
-        bail!("primary must export exactly one supported wasi:http handler interface");
-    };
+    let handler = select_handler(graph.types()[primary.ty()].exports.keys())
+        .context("selecting primary handler")?
+        .to_owned();
 
     // Register middleware packages (outermost → innermost order).
     for (index, dep) in middleware_blobs.iter().enumerate() {
@@ -114,15 +129,9 @@ async fn compose_middlewares(
         let package = Package::from_bytes(&name, None, bytes, graph.types_mut())
             .context("parsing middleware component")?;
         let world = &graph.types()[package.ty()];
-        let imports = HANDLER_INTERFACES
-            .into_iter()
-            .filter(|name| world.imports.contains_key(*name))
-            .collect::<Vec<_>>();
-        let exports = HANDLER_INTERFACES
-            .into_iter()
-            .filter(|name| world.exports.contains_key(*name))
-            .collect::<Vec<_>>();
-        if imports.as_slice() != [*handler] || exports.as_slice() != [*handler] {
+        let imports = handler_interfaces(world.imports.keys());
+        let exports = handler_interfaces(world.exports.keys());
+        if imports.as_slice() != [handler.as_str()] || exports.as_slice() != [handler.as_str()] {
             bail!("middleware{index} must import and export `{handler}` exclusively");
         }
         package_ids.push(graph.register_package(package)?);
@@ -132,10 +141,10 @@ async fn compose_middlewares(
     package_ids.push(graph.register_package(primary)?);
 
     // Wire the pipeline: outermost middleware → … → primary.
-    let outermost_export = chain(&mut graph, &package_ids, handler, handler)?;
+    let outermost_export = chain(&mut graph, &package_ids, &handler, &handler)?;
 
     // Export the outermost handler as the composed component's export.
-    graph.export(outermost_export, *handler)?;
+    graph.export(outermost_export, &handler)?;
 
     Ok(graph.encode(Default::default())?)
 }
@@ -183,6 +192,15 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("must import and export"));
         }
+    }
+
+    #[test]
+    fn rejects_ambiguous_handler_interfaces() {
+        let names = [
+            "wasi:http/handler@0.3.0".to_owned(),
+            "wasi:http/handler@0.4.0".to_owned(),
+        ];
+        assert!(select_handler(names.iter()).is_err());
     }
 
     fn dependency(data: Vec<u8>) -> TriggerDependency {
