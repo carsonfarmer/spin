@@ -114,6 +114,37 @@ mod integration_tests {
     }
 
     #[test]
+    fn wasip3_handler_does_not_retain_http_server() -> anyhow::Result<()> {
+        use spin_trigger_http::InstanceReuseConfig;
+        use std::time::Duration;
+        use test_environment::TestEnvironment;
+        use testing_framework::runtimes::in_process_spin::InProcessSpin;
+
+        let config = InProcessSpin::config_with_reuse_config(
+            ServicesConfig::none(),
+            InstanceReuseConfig::single_use_with_request_deadline(Duration::from_secs(1)),
+            |env| preboot("wasi-http-p3-streaming", env),
+        );
+        let mut env = TestEnvironment::up(config, |_| Ok(()))?;
+        let weak_server = env.runtime_mut().weak_server();
+
+        let response = env.runtime_mut().make_http_request(Request::full(
+            Method::Post,
+            "/echo",
+            &[("Host", "localhost")],
+            None,
+        ))?;
+        assert_eq!(response.status(), 200);
+
+        drop(env);
+        assert!(
+            weak_server.upgrade().is_none(),
+            "WASIp3 handler retained the HTTP server after its owner was dropped"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn http_request_deadline_interrupts_wasip2_loop() -> anyhow::Result<()> {
         use spin_trigger_http::InstanceReuseConfig;
         use std::time::{Duration, Instant};
