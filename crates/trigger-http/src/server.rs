@@ -29,7 +29,7 @@ use spin_app::{APP_DESCRIPTION_KEY, APP_NAME_KEY};
 use spin_factor_outbound_http::intercept::OutboundHttpInterceptor as EmbedderOutboundHttpInterceptor;
 use spin_factor_outbound_http::{OutboundHttpFactor, SelfRequestOrigin};
 use spin_factors::RuntimeFactors;
-use spin_factors_executor::InstanceState;
+use spin_factors_executor::{InstanceState, complete_store};
 use spin_http::{
     app_info::AppInfo,
     body,
@@ -801,7 +801,8 @@ impl<F: RuntimeFactors> WorkerState for HttpWorkerState<F> {
         Box::pin(tokio::time::sleep(self.request_timeout))
     }
 
-    fn drop(&self, store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+    fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+        complete_store(&mut store, result.as_ref().map(|_| ()));
         if let Err(error) = result {
             eprintln!("worker failed: {error:?}");
         }
