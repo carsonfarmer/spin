@@ -9,6 +9,34 @@ use spin_factors::{
     RuntimeFactorsInstanceState,
 };
 
+/// The observable outcome of a completed store.
+pub enum StoreCompletionOutcome<'a> {
+    /// The store returned successfully.
+    Returned,
+    /// The store failed.
+    Failed(&'a wasmtime::Error),
+    /// The store was dropped without an explicit outcome.
+    Dropped,
+}
+
+/// Runtime facts observed when a store completes.
+pub struct StoreCompletion<'a> {
+    /// The component executed by the store.
+    pub component_id: &'a str,
+    /// Fuel available before execution, if fuel is enabled.
+    pub initial_fuel: Option<u64>,
+    /// Fuel remaining after execution, if fuel is enabled.
+    pub remaining_fuel: Option<u64>,
+    /// Time spent actively executing guest code.
+    pub guest_active: Duration,
+    /// Time elapsed since the store was created.
+    pub wall: Duration,
+    /// The observable store outcome.
+    pub outcome: StoreCompletionOutcome<'a>,
+}
+
+type StoreCompletionObserver = Box<dyn for<'a> Fn(StoreCompletion<'a>) + Send + Sync + 'static>;
+
 /// A FactorsExecutor manages execution of a Spin app.
 ///
 /// It is generic over the executor's [`RuntimeFactors`]. Additionally, it
@@ -232,6 +260,7 @@ impl<T: RuntimeFactors, U: Send + 'static> FactorsExecutorApp<T, U> {
             instance_pre,
             app_component,
             factors: &self.executor.factors,
+            completion_observer: None,
         };
 
         for hooks in &self.executor.hooks {
@@ -252,6 +281,7 @@ pub struct FactorsInstanceBuilder<'a, F: RuntimeFactors, U: 'static> {
     factor_builders: F::InstanceBuilders,
     instance_pre: &'a InstancePre<F, U>,
     factors: &'a F,
+    completion_observer: Option<StoreCompletionObserver>,
 }
 
 impl<T: RuntimeFactors, U: 'static> FactorsInstanceBuilder<'_, T, U> {
@@ -284,6 +314,14 @@ impl<T: RuntimeFactors, U: 'static> FactorsInstanceBuilder<'_, T, U> {
     pub fn component(&self) -> &Component {
         self.instance_pre.component()
     }
+
+    /// Observes completion synchronously; the observer must not block or panic.
+    pub fn on_store_completion(
+        &mut self,
+        observer: impl for<'a> Fn(StoreCompletion<'a>) + Send + Sync + 'static,
+    ) {
+        self.completion_observer = Some(Box::new(observer));
+    }
 }
 
 impl<T: RuntimeFactors, U: Send> FactorsInstanceBuilder<'_, T, U> {
@@ -295,23 +333,9 @@ impl<T: RuntimeFactors, U: Send> FactorsInstanceBuilder<'_, T, U> {
         spin_core::Instance,
         spin_core::Store<InstanceState<T::InstanceState, U>>,
     )> {
-        let instance_state = InstanceState {
-            core: Default::default(),
-            factors: self.factors.build_instance_state(self.factor_builders)?,
-            executor: executor_instance_state,
-            cpu_time_elapsed: Duration::from_millis(0),
-            cpu_time_last_entry: None,
-            memory_used_on_init: 0,
-            component_id: self.app_component.id().into(),
-        };
-        let mut store = self.store_builder.build(instance_state)?;
-
-        #[cfg(feature = "cpu-time-metrics")]
-        store.as_mut().call_hook(|mut store, hook| {
-            CpuTimeCallHook.handle_call_event::<T, U>(store.data_mut(), hook)
-        });
-
-        let instance = self.instance_pre.instantiate_async(&mut store).await?;
+        let instance_pre = self.instance_pre;
+        let mut store = self.build_store(executor_instance_state)?;
+        let instance = instance_pre.instantiate_async(&mut store).await?;
 
         // Track memory usage after instantiation in the instance state.
         // Note: This only applies if the component has initial memory reservations.
@@ -320,7 +344,7 @@ impl<T: RuntimeFactors, U: Send> FactorsInstanceBuilder<'_, T, U> {
         Ok((instance, store))
     }
 
-    pub fn instantiate_store(
+    fn build_store(
         self,
         executor_instance_state: U,
     ) -> anyhow::Result<spin_core::Store<InstanceState<T::InstanceState, U>>> {
@@ -332,16 +356,51 @@ impl<T: RuntimeFactors, U: Send> FactorsInstanceBuilder<'_, T, U> {
             cpu_time_last_entry: None,
             memory_used_on_init: 0,
             component_id: self.app_component.id().into(),
+            started_at: self.completion_observer.as_ref().map(|_| Instant::now()),
+            initial_fuel: None,
+            remaining_fuel: None,
+            completion_observer: self.completion_observer,
         };
-        self.store_builder.build(instance_state)
+        let mut store = self.store_builder.build(instance_state)?;
+        let initial_fuel = store.as_mut().get_fuel().ok();
+        store.data_mut().initial_fuel = initial_fuel;
+        store.data_mut().remaining_fuel = initial_fuel;
+
+        if cfg!(feature = "cpu-time-metrics") || store.data().completion_observer.is_some() {
+            store.as_mut().call_hook(|mut store, hook| {
+                store.data_mut().remaining_fuel = store.get_fuel().ok();
+                CpuTimeCallHook.handle_call_event::<T, U>(store.data_mut(), hook)
+            });
+        }
+        Ok(store)
+    }
+
+    pub fn instantiate_store(
+        self,
+        executor_instance_state: U,
+    ) -> anyhow::Result<spin_core::Store<InstanceState<T::InstanceState, U>>> {
+        self.build_store(executor_instance_state)
     }
 }
 
+/// Completes a store with an explicit outcome.
+pub fn complete_store<T: 'static, U: 'static>(
+    mut store: impl wasmtime::AsContextMut<Data = InstanceState<T, U>>,
+    result: Result<(), &wasmtime::Error>,
+) {
+    let remaining_fuel = store.as_context_mut().get_fuel().ok();
+    let outcome = result.map_or_else(StoreCompletionOutcome::Failed, |_| {
+        StoreCompletionOutcome::Returned
+    });
+    store
+        .as_context_mut()
+        .data_mut()
+        .complete(remaining_fuel, outcome);
+}
+
 // Tracks CPU time used by a Wasm guest.
-#[allow(unused)]
 struct CpuTimeCallHook;
 
-#[allow(unused)]
 impl CpuTimeCallHook {
     fn handle_call_event<T: RuntimeFactors, U>(
         &self,
@@ -380,10 +439,19 @@ pub struct InstanceState<T, U> {
     cpu_time_elapsed: Duration,
     /// The memory (in bytes) consumed on initialization.
     memory_used_on_init: u64,
+    started_at: Option<Instant>,
+    initial_fuel: Option<u64>,
+    remaining_fuel: Option<u64>,
+    completion_observer: Option<StoreCompletionObserver>,
 }
 
 impl<T, U> Drop for InstanceState<T, U> {
     fn drop(&mut self) {
+        if self.cpu_time_last_entry.is_some() {
+            self.remaining_fuel = None;
+        }
+        self.complete(self.remaining_fuel, StoreCompletionOutcome::Dropped);
+
         // Record the component execution time.
         #[cfg(feature = "cpu-time-metrics")]
         spin_telemetry::metrics::histogram!(
@@ -411,6 +479,23 @@ impl<T, U> Drop for InstanceState<T, U> {
 }
 
 impl<T, U> InstanceState<T, U> {
+    fn complete(&mut self, remaining_fuel: Option<u64>, outcome: StoreCompletionOutcome<'_>) {
+        let Some(observer) = self.completion_observer.take() else {
+            return;
+        };
+        if let Some(started) = self.cpu_time_last_entry.take() {
+            self.cpu_time_elapsed += started.elapsed();
+        }
+        observer(StoreCompletion {
+            component_id: &self.component_id,
+            initial_fuel: self.initial_fuel,
+            remaining_fuel,
+            guest_active: self.cpu_time_elapsed,
+            wall: self.started_at.unwrap().elapsed(),
+            outcome,
+        });
+    }
+
     /// Provides access to the [`spin_core::State`].
     pub fn core_state(&self) -> &spin_core::State {
         &self.core
@@ -456,6 +541,8 @@ impl<T: RuntimeFactorsInstanceState, U> AsInstanceState<T> for InstanceState<T, 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use spin_factor_wasi::{DummyFilesMounter, WasiFactor};
     use spin_factors::RuntimeFactors;
     use spin_factors_test::TestEnvironment;
@@ -476,7 +563,9 @@ mod tests {
         let locked = env.build_locked_app().await?;
         let app = App::new("test-app", locked);
 
-        let engine_builder = spin_core::Engine::builder(&Default::default())?;
+        let mut config = spin_core::Config::default();
+        config.wasmtime_config().consume_fuel(true);
+        let engine_builder = spin_core::Engine::builder(&config)?;
         let executor = Arc::new(FactorsExecutor::new(engine_builder, env.factors)?);
 
         let factors_app = executor
@@ -494,8 +583,126 @@ mod tests {
             .unwrap()
             .args(["foo"]);
 
-        let (_instance, _store) = instance_builder.instantiate(()).await?;
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        instance_builder.on_store_completion(observer(observations.clone()));
+
+        let (instance, mut store) = instance_builder.instantiate(()).await?;
+        store.as_mut().set_fuel(100)?;
+        store.data_mut().initial_fuel = Some(100);
+        store.data_mut().remaining_fuel = Some(100);
+        store.data_mut().cpu_time_elapsed = Duration::ZERO;
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        run.call_async(&mut store, ()).await?;
+        complete_store(&mut store, Ok(()));
+        drop(store);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].component_id, "empty");
+        assert_eq!(observations[0].outcome, ObservedOutcome::Returned);
+        assert!(observations[0].remaining_fuel < Some(100));
+        assert!(observations[0].guest_active > Duration::ZERO);
         Ok(())
+    }
+
+    #[test]
+    fn completion_outcomes_are_observed_exactly_once() -> anyhow::Result<()> {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+
+        let mut returned = test_store(observations.clone())?;
+        complete_store(&mut returned, Ok(()));
+        complete_store(&mut returned, Ok(()));
+        drop(returned);
+
+        let mut failed = test_store(observations.clone())?;
+        let error = wasmtime::Error::msg("boom");
+        complete_store(&mut failed, Err(&error));
+        drop(failed);
+
+        drop(test_store(observations.clone())?);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].outcome, ObservedOutcome::Returned);
+        assert_eq!(
+            observations[1].outcome,
+            ObservedOutcome::Failed("boom".into())
+        );
+        assert_eq!(observations[2].outcome, ObservedOutcome::Dropped);
+        assert!(observations.iter().all(|o| o.initial_fuel == Some(100)));
+        assert!(observations.iter().all(|o| o.remaining_fuel == Some(80)));
+        Ok(())
+    }
+
+    #[test]
+    fn active_drop_does_not_report_stale_remaining_fuel() -> anyhow::Result<()> {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut store = test_store(observations.clone())?;
+        store.data_mut().cpu_time_last_entry = Some(Instant::now());
+        drop(store);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].outcome, ObservedOutcome::Dropped);
+        assert_eq!(observations[0].remaining_fuel, None);
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ObservedOutcome {
+        Returned,
+        Failed(String),
+        Dropped,
+    }
+
+    struct Observed {
+        component_id: String,
+        initial_fuel: Option<u64>,
+        remaining_fuel: Option<u64>,
+        guest_active: Duration,
+        outcome: ObservedOutcome,
+    }
+
+    fn observer(observations: Arc<Mutex<Vec<Observed>>>) -> StoreCompletionObserver {
+        Box::new(move |completion| {
+            let outcome = match completion.outcome {
+                StoreCompletionOutcome::Returned => ObservedOutcome::Returned,
+                StoreCompletionOutcome::Failed(error) => ObservedOutcome::Failed(error.to_string()),
+                StoreCompletionOutcome::Dropped => ObservedOutcome::Dropped,
+            };
+            observations.lock().unwrap().push(Observed {
+                component_id: completion.component_id.into(),
+                initial_fuel: completion.initial_fuel,
+                remaining_fuel: completion.remaining_fuel,
+                guest_active: completion.guest_active,
+                outcome,
+            });
+        })
+    }
+
+    fn test_store(
+        observations: Arc<Mutex<Vec<Observed>>>,
+    ) -> anyhow::Result<spin_core::Store<InstanceState<(), ()>>> {
+        let mut config = spin_core::Config::default();
+        config.wasmtime_config().consume_fuel(true);
+        let engine: spin_core::Engine<InstanceState<(), ()>> =
+            spin_core::Engine::builder(&config)?.build();
+        let state = InstanceState {
+            core: Default::default(),
+            factors: (),
+            executor: (),
+            component_id: "test".into(),
+            cpu_time_last_entry: None,
+            cpu_time_elapsed: Duration::ZERO,
+            memory_used_on_init: 0,
+            started_at: Some(Instant::now()),
+            initial_fuel: Some(100),
+            remaining_fuel: Some(80),
+            completion_observer: Some(observer(observations)),
+        };
+        let mut store = engine.store_builder().build(state)?;
+        store.as_mut().set_fuel(80)?;
+        Ok(store)
     }
 
     struct DummyComponentLoader;
@@ -508,7 +715,25 @@ mod tests {
             _component: &AppComponent,
             _trigger_dependencies_composer: &impl TriggerDependenciesComposer,
         ) -> anyhow::Result<Component> {
-            Ok(Component::new(engine, "(component)")?)
+            Ok(Component::new(
+                engine,
+                r#"
+                    (component
+                        (core module $module
+                            (func (export "run")
+                                i32.const 1
+                                i32.const 2
+                                i32.add
+                                drop
+                            )
+                        )
+                        (core instance $instance (instantiate $module))
+                        (func (export "run")
+                            (canon lift (core func $instance "run"))
+                        )
+                    )
+                "#,
+            )?)
         }
     }
 }

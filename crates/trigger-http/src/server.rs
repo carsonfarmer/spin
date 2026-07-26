@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -26,9 +26,10 @@ use hyper_util::{
 use pin_project_lite::pin_project;
 use rand::RngExt;
 use spin_app::{APP_DESCRIPTION_KEY, APP_NAME_KEY};
+use spin_factor_outbound_http::intercept::OutboundHttpInterceptor as EmbedderOutboundHttpInterceptor;
 use spin_factor_outbound_http::{OutboundHttpFactor, SelfRequestOrigin};
 use spin_factors::RuntimeFactors;
-use spin_factors_executor::InstanceState;
+use spin_factors_executor::{InstanceState, complete_store};
 use spin_http::{
     app_info::AppInfo,
     body,
@@ -102,6 +103,7 @@ pub struct HttpServer<F: RuntimeFactors> {
     component_trigger_configs: HashMap<spin_http::routes::TriggerLookupKey, HttpTriggerConfig>,
     // Component ID -> handler type
     component_handler_types: HashMap<String, HandlerType<HttpHandlerState<F>>>,
+    embedder_outbound_http_interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
 }
 
 impl<F: RuntimeFactors> HttpServer<F> {
@@ -185,7 +187,16 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_handler_types,
             output_format,
             request_deadline: reuse_config.request_deadline,
+            embedder_outbound_http_interceptor: None,
         })
+    }
+
+    pub(crate) fn with_embedder_outbound_http_interceptor(
+        mut self,
+        interceptor: Option<Arc<dyn EmbedderOutboundHttpInterceptor>>,
+    ) -> Self {
+        self.embedder_outbound_http_interceptor = interceptor;
+        self
     }
 
     fn handler_type_for_component(
@@ -483,7 +494,10 @@ impl<F: RuntimeFactors> HttpServer<F> {
         let self_addr = self.get_local_addr();
         let origin = SelfRequestOrigin::create(self_scheme, &self_addr.to_string())?;
         outbound_http.set_self_request_origin(origin);
-        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(self.clone()))?;
+        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(
+            self.clone(),
+            self.embedder_outbound_http_interceptor.clone(),
+        ))?;
         Ok(instance_builder)
     }
 
@@ -787,7 +801,8 @@ impl<F: RuntimeFactors> WorkerState for HttpWorkerState<F> {
         Box::pin(tokio::time::sleep(self.request_timeout))
     }
 
-    fn drop(&self, store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+    fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+        complete_store(&mut store, result.as_ref().map(|_| ()));
         if let Err(error) = result {
             eprintln!("worker failed: {error:?}");
         }
@@ -799,13 +814,13 @@ impl<F: RuntimeFactors> WorkerState for HttpWorkerState<F> {
 pub(crate) struct HttpHandlerState<F: RuntimeFactors> {
     component_id: String,
     reuse_config: InstanceReuseConfig,
-    server: OnceLock<Arc<HttpServer<F>>>,
+    server: OnceLock<Weak<HttpServer<F>>>,
     self_scheme: OnceLock<Scheme>,
 }
 
 impl<F: RuntimeFactors> HttpHandlerState<F> {
     pub(crate) fn init_once(&self, server: &Arc<HttpServer<F>>, first_uri: &Uri) {
-        self.server.get_or_init(|| server.clone());
+        self.server.get_or_init(|| Arc::downgrade(server));
         if let Some(scheme) = first_uri.scheme() {
             self.self_scheme.get_or_init(|| scheme.clone());
         }
@@ -821,10 +836,13 @@ impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
         &self,
     ) -> wasmtime::Result<Instance<Self::StoreData, Self::WorkerExpiration, Self::WorkerState>>
     {
-        let (instance, mut store) = self
+        let server = self
             .server
             .get()
             .expect("server should have been set")
+            .upgrade()
+            .ok_or_else(|| wasmtime::format_err!("HTTP server is no longer available"))?;
+        let (instance, mut store) = server
             .trigger_instance_builder(&self.component_id, self.self_scheme.get())
             .to_wasmtime_result()?
             .instantiate(())

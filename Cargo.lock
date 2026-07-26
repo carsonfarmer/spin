@@ -6212,7 +6212,7 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.17.0"
-source = "git+https://github.com/oras-project/rust-oci-client?rev=49c409df9a544f2d02ae4ae6a5fd8510ec74f438#49c409df9a544f2d02ae4ae6a5fd8510ec74f438"
+source = "git+https://github.com/carsonfarmer/rust-oci-client?rev=1e1c9f9edbdd46cd2cf490b5d7a9e6612714c4aa#1e1c9f9edbdd46cd2cf490b5d7a9e6612714c4aa"
 dependencies = [
  "bytes",
  "chrono",
@@ -6221,7 +6221,6 @@ dependencies = [
  "http 1.4.2",
  "http-auth",
  "jsonwebtoken",
- "lazy_static 1.5.0",
  "oci-spec 0.10.0",
  "olpc-cjson",
  "regex",
@@ -8991,6 +8990,7 @@ dependencies = [
  "spin-dependency-wit",
  "spin-doctor",
  "spin-environments",
+ "spin-factor-outbound-http",
  "spin-factor-outbound-networking",
  "spin-factors-executor",
  "spin-http",
@@ -9019,6 +9019,7 @@ dependencies = [
  "url",
  "uuid",
  "vergen",
+ "wasmtime-wasi-http",
  "watchexec",
  "watchexec-events",
  "watchexec-filterer-globset",
@@ -10511,6 +10512,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "spin-app",
+ "spin-factor-outbound-http",
  "spin-http",
  "spin-loader",
  "spin-runtime-factors",

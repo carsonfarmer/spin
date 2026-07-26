@@ -11,7 +11,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 spin-app = { path = "../app" }
-spin-core = { path = "../core" }
+spin-core = { path = "../core", features = ["call-hook"] }
 spin-factors = { path = "../factors" }
 spin-telemetry = { path = "../telemetry" }
 tracing = { workspace = true }

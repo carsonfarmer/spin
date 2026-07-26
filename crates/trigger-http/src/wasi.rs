@@ -13,7 +13,7 @@ use spin_factor_outbound_http::wasi_2023_10_18::Proxy as Proxy2023_10_18;
 use spin_factor_outbound_http::wasi_2023_11_10::Proxy as Proxy2023_11_10;
 use spin_factor_outbound_http::wasi_2026_03_15::Service as Service2026_03_15;
 use spin_factors::{RuntimeFactors, RuntimeFactorsInstanceState};
-use spin_factors_executor::InstanceState;
+use spin_factors_executor::{InstanceState, complete_store};
 use spin_http::routes::RouteMatch;
 use spin_http::trigger::HandlerType;
 use tokio::{sync::oneshot, task};
@@ -145,6 +145,7 @@ impl<S: HandlerState> WasiHttpExecutor<'_, S> {
                     store.data().core_state().memory_consumed()
                 );
 
+                complete_store(&mut store, result.as_ref().map(|_| ()));
                 result
             }
             .in_current_span(),
@@ -207,7 +208,7 @@ async fn handle_2026_03_15<T: RuntimeFactorsInstanceState, U: Send>(
     let (tx, rx) = oneshot::channel();
     task::spawn(
         async move {
-            store
+            let result = store
                 .as_context_mut()
                 .run_concurrent(async |accessor| {
                     let response = guest
@@ -228,7 +229,9 @@ async fn handle_2026_03_15<T: RuntimeFactorsInstanceState, U: Send>(
 
                     Ok(())
                 })
-                .await?
+                .await;
+            complete_store(&mut store, result.as_ref().map(|_| ()));
+            result?
         }
         .map_err(|e: anyhow::Error| {
             if std::io::stderr().is_terminal() {
