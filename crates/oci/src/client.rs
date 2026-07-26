@@ -19,7 +19,9 @@ use spin_common::url::parse_file_url;
 use spin_compose::ComponentSourceLoaderFs;
 use spin_loader::FilesMountStrategy;
 use spin_loader::cache::Cache;
-use spin_locked_app::locked::{ContentPath, ContentRef, LockedApp, LockedComponent};
+use spin_locked_app::locked::{
+    ContentPath, ContentRef, LockedApp, LockedComponent, LockedComponentSource,
+};
 use tokio::fs;
 use walkdir::WalkDir;
 
@@ -316,39 +318,14 @@ impl Client {
         let mut layers = Vec::new();
 
         for mut c in locked.components {
-            // Add the wasm module for the component as layers.
-            let source = c
-                .source
-                .content
-                .source
-                .as_ref()
-                .context("component loaded from disk should contain a file source")?;
+            layers.push(self.package_wasm(&mut c.source).await?);
 
-            let source = parse_file_url(source.as_str())?;
-            let layer = Self::wasm_layer(&source).await?;
-
-            // Update the module source with the content ref of the layer.
-            c.source.content = self.content_ref_for_layer(&layer);
-
-            layers.push(layer);
-
-            let mut deps = BTreeMap::default();
-            for (dep_name, mut dep) in c.dependencies {
-                let source = dep
-                    .source
-                    .content
-                    .source
-                    .context("dependency loaded from disk should contain a file source")?;
-                let source = parse_file_url(source.as_str())?;
-
-                let layer = Self::wasm_layer(&source).await?;
-
-                dep.source.content = self.content_ref_for_layer(&layer);
-                deps.insert(dep_name, dep);
-
-                layers.push(layer);
+            for dependency in c.dependencies.values_mut() {
+                layers.push(self.package_wasm(&mut dependency.source).await?);
             }
-            c.dependencies = deps;
+            for dependency in c.trigger_dependencies.values_mut().flatten() {
+                layers.push(self.package_wasm(&mut dependency.source).await?);
+            }
 
             c.files = self
                 .assemble_content_layers(assembly_mode, &mut layers, c.files.as_slice())
@@ -357,6 +334,17 @@ impl Client {
         }
 
         Ok((layers, components))
+    }
+
+    async fn package_wasm(&self, source: &mut LockedComponentSource) -> Result<ImageLayer> {
+        let path = source
+            .content
+            .source
+            .as_ref()
+            .context("component loaded from disk should contain a file source")?;
+        let layer = Self::wasm_layer(&parse_file_url(path)?).await?;
+        source.content = self.content_ref_for_layer(&layer);
+        Ok(layer)
     }
 
     async fn assemble_layers_composed(
@@ -1433,6 +1421,77 @@ mod test {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn can_round_trip_uncomposed_trigger_dependency() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let primary = working_dir.path().join("primary.wasm");
+        let middleware = working_dir.path().join("middleware.wasm");
+        tokio::fs::write(&primary, b"primary").await.unwrap();
+        tokio::fs::write(&middleware, b"middleware").await.unwrap();
+
+        let components = from_json!([{
+            "id": "primary",
+            "source": {
+                "content_type": "application/wasm",
+                "source": file_url(&primary),
+            },
+            "trigger_dependencies": {
+                "middleware": [{
+                    "source": {
+                        "content_type": "application/wasm",
+                        "source": file_url(&middleware),
+                    },
+                    "export": null,
+                }]
+            }
+        }]);
+        let mut locked = LockedApp {
+            spin_lock_version: Default::default(),
+            components,
+            triggers: Default::default(),
+            metadata: Default::default(),
+            variables: Default::default(),
+            must_understand: Default::default(),
+            host_requirements: Default::default(),
+        };
+        let mut client = Client::new(false, Some(working_dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        client.opts.content_ref_inline_max_size = 0;
+        let layers = client
+            .assemble_layers(&mut locked, AssemblyMode::Simple, ComposeMode::Skip)
+            .await
+            .unwrap();
+        assert_eq!(layers.len(), 2);
+
+        let encoded = serde_json::to_vec(&locked).unwrap();
+        let mut round_trip: LockedApp = serde_json::from_slice(&encoded).unwrap();
+        let content = &round_trip.components[0].trigger_dependencies["middleware"][0]
+            .source
+            .content;
+        assert!(content.source.is_none());
+        let digest = content.digest.as_ref().unwrap().clone();
+        assert!(layers.iter().any(|layer| layer.sha256_digest() == digest));
+
+        for layer in &layers {
+            client
+                .cache
+                .write_wasm(&layer.data, layer.sha256_digest())
+                .await
+                .unwrap();
+        }
+        crate::OciLoader::new(working_dir.path())
+            .resolve_component_content_refs(&mut round_trip.components[0], &client.cache)
+            .await
+            .unwrap();
+        let content = &round_trip.components[0].trigger_dependencies["middleware"][0]
+            .source
+            .content;
+        assert!(content.digest.is_none());
+        let path = parse_file_url(content.source.as_deref().unwrap()).unwrap();
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"middleware");
     }
 
     fn generate_dummy_component(wit: &str, world: &str) -> Vec<u8> {
