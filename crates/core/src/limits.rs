@@ -18,14 +18,16 @@ impl ResourceLimiterAsync for StoreLimitsAsync {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
+        let growth = u64::try_from(desired.saturating_sub(current)).unwrap_or(u64::MAX);
         let can_grow = if let Some(limit) = self.max_memory_size {
-            desired <= limit
+            self.memory_consumed
+                .checked_add(growth)
+                .is_some_and(|desired| desired <= u64::try_from(limit).unwrap_or(u64::MAX))
         } else {
             true
         };
         if can_grow {
-            self.memory_consumed =
-                (self.memory_consumed as i64 + (desired as i64 - current as i64)) as u64;
+            self.memory_consumed = self.memory_consumed.saturating_add(growth);
         } else {
             tracing::warn!(
                 "error.type" = "memory_limit_exceeded",
@@ -76,13 +78,15 @@ mod tests {
     #[tokio::test]
     async fn test_store_limits_memory() {
         let mut limits = StoreLimitsAsync {
-            max_memory_size: Some(65536),
+            max_memory_size: Some(131072),
             ..Default::default()
         };
         assert!(limits.memory_growing(0, 65536, None).await.unwrap());
         assert_eq!(limits.memory_consumed, 65536);
+        assert!(limits.memory_growing(0, 65536, None).await.unwrap());
+        assert_eq!(limits.memory_consumed, 131072);
         assert!(!limits.memory_growing(65536, 131072, None).await.unwrap());
-        assert_eq!(limits.memory_consumed, 65536);
+        assert_eq!(limits.memory_consumed, 131072);
     }
 
     #[tokio::test]
