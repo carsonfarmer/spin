@@ -944,6 +944,14 @@ fn add_inferred(map: &mut BTreeMap<String, String>, key: &str, value: Option<Str
 
 const SPIN_LOCKED_URL: &str = "SPIN_LOCKED_URL";
 const SPIN_WORKING_DIR: &str = "SPIN_WORKING_DIR";
+const SPIN_BIN_PATH: &str = "SPIN_BIN_PATH";
+
+fn spin_bin_path(configured: Option<std::ffi::OsString>) -> std::io::Result<PathBuf> {
+    match configured {
+        Some(path) => Ok(path.into()),
+        None => std::env::current_exe(),
+    }
+}
 
 async fn precompose_using_trigger(
     c: &LockedComponent,
@@ -965,7 +973,9 @@ async fn precompose_using_trigger(
         _ => vec![format!("trigger-{resolve_extras_using}")],
     };
 
-    let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+    let spin_bin = spin_bin_path(std::env::var_os(SPIN_BIN_PATH))
+        .map_err(|e| ComposeError::PrepareError(e.into()))?;
+    let mut cmd = tokio::process::Command::new(spin_bin);
     cmd.args(resolver_subcmd)
         .args(["--precompose-only", "--precompose-component-id"])
         .arg(&c.id)
@@ -1035,6 +1045,23 @@ fn fs_safe_segment(segment: &str) -> impl AsRef<Path> + '_ {
 mod test {
     use super::*;
     use wit_parser::{LiftLowerAbi, ManglingAndAbi};
+
+    #[test]
+    fn precomposition_uses_configured_spin_binary() {
+        let configured = PathBuf::from("/configured/spin");
+        assert_eq!(
+            configured,
+            spin_bin_path(Some(configured.clone().into_os_string())).unwrap()
+        );
+    }
+
+    #[test]
+    fn precomposition_falls_back_to_current_executable() {
+        assert_eq!(
+            std::env::current_exe().unwrap(),
+            spin_bin_path(None).unwrap()
+        );
+    }
 
     #[test]
     fn can_parse_digest_from_manifest_url() {
