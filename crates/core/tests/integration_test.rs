@@ -47,6 +47,17 @@ async fn test_max_memory_size_violated() {
     assert_eq!(trap.0, 1);
 }
 
+#[test]
+fn test_initial_fuel() {
+    let mut config = Config::default();
+    config.wasmtime_config().consume_fuel(true);
+    let engine = Engine::<State>::builder(&config).unwrap().build();
+    let mut builder = engine.store_builder();
+    builder.initial_fuel(123);
+    let store = builder.build(State::default()).unwrap();
+    assert_eq!(store.as_ref().get_fuel().unwrap(), 123);
+}
+
 // FIXME: racy timing test
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_deadline_obeyed() {
