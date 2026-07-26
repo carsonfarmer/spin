@@ -15,6 +15,7 @@ use spin_factor_variables::VariablesFactor;
 use spin_factors::{RuntimeFactors, anyhow};
 use spin_factors_test::{TestEnvironment, toml};
 use spin_world::async_trait;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing::{
     Subscriber,
     field::{Field, Visit},
@@ -139,6 +140,146 @@ async fn override_connect_addr_disallowed_private_ip_fails() -> anyhow::Result<(
     assert_matches!(
         future_resp.unwrap_ready().unwrap(),
         Err(ErrorCode::DestinationIpProhibited),
+    );
+    Ok(())
+}
+
+struct DelayedContinue {
+    delay: Duration,
+    address: std::net::SocketAddr,
+}
+
+#[async_trait]
+impl OutboundHttpInterceptor for DelayedContinue {
+    async fn intercept(
+        &self,
+        mut request: InterceptRequest,
+    ) -> wasmtime_wasi_http::p2::HttpResult<InterceptOutcome> {
+        tokio::time::sleep(self.delay).await;
+        request.override_connect_addr(self.address);
+        Ok(InterceptOutcome::Continue(request))
+    }
+}
+
+async fn delayed_http_server(delay: Duration) -> anyhow::Result<std::net::SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::time::sleep(delay).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    Ok(address)
+}
+
+fn shared_deadline_config() -> OutgoingRequestConfig {
+    OutgoingRequestConfig {
+        use_tls: false,
+        connect_timeout: Duration::from_secs(1),
+        first_byte_timeout: Duration::from_millis(250),
+        between_bytes_timeout: Duration::from_secs(1),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn p2_interceptor_and_network_share_first_byte_deadline() -> anyhow::Result<()> {
+    let address = delayed_http_server(Duration::from_millis(150)).await?;
+    let mut state = test_instance_state("http://example.test", true).await?;
+    state.http.set_request_interceptor(DelayedContinue {
+        delay: Duration::from_millis(150),
+        address,
+    })?;
+
+    let wasi_http = OutboundHttpFactor::get_wasi_http_impl(&mut state).unwrap();
+    let request = Request::get("http://example.test").body(Default::default())?;
+    let mut response = wasi_http
+        .hooks
+        .send_request(request, shared_deadline_config())?;
+    response.ready().await;
+
+    assert_matches!(
+        response.unwrap_ready().unwrap(),
+        Err(ErrorCode::ConnectionReadTimeout),
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn p3_interceptor_and_network_share_first_byte_deadline() -> anyhow::Result<()> {
+    let address = delayed_http_server(Duration::from_millis(150)).await?;
+    let mut state = test_instance_state("http://example.test", true).await?;
+    state.http.set_request_interceptor(DelayedContinue {
+        delay: Duration::from_millis(150),
+        address,
+    })?;
+
+    let p3_view = OutboundHttpFactor::get_wasi_p3_http_impl(&mut state).unwrap();
+    let request = Request::get("http://example.test").body(empty_p3_body())?;
+    let config = shared_deadline_config();
+    let result = Box::into_pin(p3_view.hooks.send_request(
+        request,
+        Some(RequestOptions {
+            connect_timeout: Some(config.connect_timeout),
+            first_byte_timeout: Some(config.first_byte_timeout),
+            between_bytes_timeout: Some(config.between_bytes_timeout),
+        }),
+        p3_noop_cleanup_fut(),
+    ))
+    .await;
+
+    let Err(error) = result else {
+        bail!("expected interceptor and network request to exceed their shared deadline")
+    };
+    assert_matches!(
+        error.downcast()?,
+        p3_types::ErrorCode::ConnectionReadTimeout
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_byte_deadline_applies_to_completing_interceptor() -> anyhow::Result<()> {
+    let mut state = test_instance_state("https://example.test", true).await?;
+    state.http.set_request_interceptor({
+        struct Interceptor;
+        #[async_trait]
+        impl OutboundHttpInterceptor for Interceptor {
+            async fn intercept(
+                &self,
+                _request: InterceptRequest,
+            ) -> wasmtime_wasi_http::p2::HttpResult<InterceptOutcome> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let body = Empty::<Bytes>::new()
+                    .map_err(|never: std::convert::Infallible| match never {})
+                    .boxed_unsync();
+                Ok(InterceptOutcome::Complete(http::Response::new(body)))
+            }
+        }
+        Interceptor
+    })?;
+
+    let p3_view = OutboundHttpFactor::get_wasi_p3_http_impl(&mut state).unwrap();
+    let request = Request::get("https://example.test").body(empty_p3_body())?;
+    let result = Box::into_pin(p3_view.hooks.send_request(
+        request,
+        Some(RequestOptions {
+            connect_timeout: Some(Duration::from_secs(1)),
+            first_byte_timeout: Some(Duration::from_millis(10)),
+            between_bytes_timeout: Some(Duration::from_secs(1)),
+        }),
+        p3_noop_cleanup_fut(),
+    ))
+    .await;
+
+    let Err(error) = result else {
+        bail!("expected interceptor to exceed first-byte deadline")
+    };
+    assert_matches!(
+        error.downcast()?,
+        p3_types::ErrorCode::ConnectionReadTimeout
     );
     Ok(())
 }

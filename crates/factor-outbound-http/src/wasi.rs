@@ -33,7 +33,7 @@ use spin_factors::RuntimeFactorsInstanceState;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_rustls::client::TlsStream;
 use tower_service::Service;
@@ -414,10 +414,17 @@ impl RequestSender {
         spin_telemetry::inject_trace_context(&mut request);
 
         // Run any configured request interceptor
+        let first_byte_deadline = Instant::now() + config.first_byte_timeout;
         let mut override_connect_addr = None;
         if let Some(interceptor) = &self.request_interceptor {
             let intercept_request = std::mem::take(&mut request).into();
-            match interceptor.intercept(intercept_request).await? {
+            match timeout_at(
+                first_byte_deadline,
+                interceptor.intercept(intercept_request),
+            )
+            .await
+            .map_err(|_| ErrorCode::ConnectionReadTimeout)??
+            {
                 InterceptOutcome::Continue(mut req) => {
                     override_connect_addr = req.override_connect_addr.take();
                     request = req.into_hyper_request();
@@ -452,7 +459,7 @@ impl RequestSender {
         );
 
         Ok(self
-            .send_request(request, config, override_connect_addr)
+            .send_request(request, config, override_connect_addr, first_byte_deadline)
             .await?)
     }
 
@@ -532,12 +539,13 @@ impl RequestSender {
         request: OutgoingRequest,
         config: OutgoingRequestConfig,
         override_connect_addr: Option<SocketAddr>,
+        first_byte_deadline: Instant,
     ) -> Result<IncomingResponse, ErrorCode> {
         let OutgoingRequestConfig {
             use_tls,
             connect_timeout,
-            first_byte_timeout,
             between_bytes_timeout,
+            ..
         } = config;
 
         let tls_client_config = if use_tls {
@@ -574,7 +582,7 @@ impl RequestSender {
             },
         );
 
-        let resp = timeout(first_byte_timeout, resp)
+        let resp = timeout_at(first_byte_deadline, resp)
             .await
             .map_err(|_| ErrorCode::ConnectionReadTimeout)?
             .map_err(hyper_legacy_request_error)?
