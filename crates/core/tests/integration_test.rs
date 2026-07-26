@@ -47,6 +47,33 @@ async fn test_max_memory_size_violated() {
     assert_eq!(trap.0, 1);
 }
 
+#[test]
+fn test_fuel_async_yield_interval() {
+    let mut config = Config::default();
+    config.wasmtime_config().consume_fuel(true);
+    let engine = Engine::<State>::builder(&config).unwrap().build();
+    let mut builder = engine.store_builder();
+    builder.fuel_async_yield_interval(10);
+    builder.build(State::default()).unwrap();
+}
+
+#[test]
+fn test_zero_fuel_async_yield_interval_is_rejected() {
+    let mut config = Config::default();
+    config.wasmtime_config().consume_fuel(true);
+    let engine = Engine::<State>::builder(&config).unwrap().build();
+    let mut builder = engine.store_builder();
+    builder.fuel_async_yield_interval(0);
+    let Err(error) = builder.build(State::default()) else {
+        panic!("zero fuel yield interval should be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("fuel_async_yield_interval must not be 0")
+    );
+}
+
 // FIXME: racy timing test
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_deadline_obeyed() {
