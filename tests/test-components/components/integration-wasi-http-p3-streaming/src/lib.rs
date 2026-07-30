@@ -58,6 +58,10 @@ impl Guest for Component {
                     .0
                 }
 
+                (Method::Get, Some("/cpu")) => loop {
+                    core::hint::black_box(());
+                },
+
                 (Method::Get, Some("/hash-all")) => {
                     // Send outgoing GET requests to the specified URLs and stream
                     // the hashes of the response bodies as they arrive.
