@@ -98,10 +98,14 @@ hyper-util = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 runtime-tests = { path = "tests/runtime-tests" }
+spin-factor-outbound-http = { path = "crates/factor-outbound-http" }
+spin-factors = { path = "crates/factors" }
 test-codegen-macro = { path = "crates/test-codegen-macro" }
 test-components = { path = "tests/test-components" }
 test-environment = { workspace = true }
 testing-framework = { path = "tests/testing-framework" }
+wasmtime = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
 
 [build-dependencies]
 cargo-target-dep = { git = "https://github.com/fermyon/cargo-target-dep", rev = "482f269eceb7b1a7e8fc618bf8c082dd24979cf1" }

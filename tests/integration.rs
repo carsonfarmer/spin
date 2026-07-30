@@ -15,6 +15,272 @@ mod integration_tests {
     };
 
     #[test]
+    fn wasip3_fuel_yield_recovers_terminal_store_before_epoch_backstop() -> anyhow::Result<()> {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Empty};
+        use spin_factor_outbound_http::OutboundHttpFactor;
+        use spin_factors_executor::{StoreCompletionOutcome, complete_store};
+        use spin_runtime_factors::{FactorsBuilder, TriggerAppArgs, TriggerFactors};
+        use spin_trigger::{
+            cli::{FactorsConfig, TriggerAppBuilder},
+            loader::ComponentLoader,
+        };
+        use spin_trigger_http::{HttpTrigger, InstanceReuseConfig, OutputFormat};
+        use std::{
+            convert::Infallible,
+            future::Future,
+            pin::Pin,
+            sync::{Arc, Mutex},
+            task::{Context as TaskContext, Poll},
+            time::Duration,
+        };
+        use tokio::sync::oneshot;
+        use wasmtime::{Store, StoreContextMut, Trap, component::GuestTaskId};
+        use wasmtime_wasi_http::{
+            handler::{
+                HandlerState, Instance, Proxy, ProxyHandler, ShouldAccept, ViewFn,
+                WorkerExpiration, WorkerState, WorkerStatus,
+            },
+            p3::bindings::Service,
+        };
+
+        const INITIAL_FUEL: u64 = 10_000_000_000;
+        const YIELD_INTERVAL: u64 = 10_000;
+        const WORKER_TIMEOUT: Duration = Duration::from_millis(50);
+        const EPOCH_BACKSTOP: Duration = Duration::from_millis(500);
+
+        #[derive(Debug)]
+        struct Completion {
+            remaining_fuel: Option<u64>,
+            wall: Duration,
+            error: String,
+            interrupted: bool,
+        }
+
+        struct Expiration {
+            sleep: Pin<Box<tokio::time::Sleep>>,
+        }
+
+        impl WorkerExpiration for Expiration {
+            fn poll(
+                mut self: Pin<&mut Self>,
+                cx: &mut TaskContext<'_>,
+                _: WorkerStatus,
+                start: std::time::Instant,
+            ) -> Poll<()> {
+                let deadline = (start + WORKER_TIMEOUT).into();
+                if self.sleep.deadline() != deadline {
+                    self.sleep.as_mut().reset(deadline);
+                }
+                self.sleep.as_mut().poll(cx)
+            }
+        }
+
+        struct Worker;
+
+        impl WorkerState for Worker {
+            type StoreData = spin_factors_executor::InstanceState<
+                <TriggerFactors as spin_factors::RuntimeFactors>::InstanceState,
+                (),
+            >;
+            type RequestId = ();
+
+            fn should_accept_request(&self, _: usize, _: usize) -> ShouldAccept {
+                ShouldAccept::Never
+            }
+
+            fn on_request_start(
+                &self,
+                _: StoreContextMut<'_, Self::StoreData>,
+                _: (),
+                _: GuestTaskId,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> {
+                Box::pin(tokio::time::sleep(EPOCH_BACKSTOP * 2))
+            }
+
+            fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+                complete_store(&mut store, result.as_ref().map(|_| ()));
+            }
+        }
+
+        type App = spin_trigger::TriggerApp<HttpTrigger, TriggerFactors>;
+
+        struct Handler {
+            app: Arc<App>,
+            completion: Arc<Mutex<Option<oneshot::Sender<Completion>>>>,
+            yield_fuel: bool,
+        }
+
+        impl HandlerState for Handler {
+            type StoreData = <Worker as WorkerState>::StoreData;
+            type WorkerExpiration = Expiration;
+            type WorkerState = Worker;
+
+            async fn instantiate(
+                &self,
+            ) -> wasmtime::Result<
+                Instance<Self::StoreData, Self::WorkerExpiration, Self::WorkerState>,
+            > {
+                let mut builder = self
+                    .app
+                    .prepare("wasi-http-async")
+                    .map_err(wasmtime::Error::from_anyhow)?;
+                let completion = self.completion.clone();
+                builder.on_store_completion(move |observed| {
+                    let (error, interrupted) = match observed.outcome {
+                        StoreCompletionOutcome::Returned => ("returned".to_owned(), false),
+                        StoreCompletionOutcome::Dropped => ("dropped".to_owned(), false),
+                        StoreCompletionOutcome::Failed(error) => (
+                            format!("{error:#}"),
+                            matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt)),
+                        ),
+                    };
+                    let record = Completion {
+                        remaining_fuel: observed.remaining_fuel,
+                        wall: observed.wall,
+                        error,
+                        interrupted,
+                    };
+                    completion
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("completion observer ran more than once")
+                        .send(record)
+                        .ok();
+                });
+                let mut store = builder
+                    .instantiate_store(())
+                    .map_err(wasmtime::Error::from_anyhow)?;
+                store.as_mut().set_fuel(INITIAL_FUEL)?;
+                store
+                    .as_mut()
+                    .fuel_async_yield_interval(self.yield_fuel.then_some(YIELD_INTERVAL))?;
+                let instance = self
+                    .app
+                    .get_instance_pre("wasi-http-async")
+                    .map_err(wasmtime::Error::from_anyhow)?
+                    .instantiate_async(&mut store)
+                    .await?;
+                store.set_deadline(std::time::Instant::now() + EPOCH_BACKSTOP);
+                let mut store = store.into_inner();
+                let proxy = Proxy::P3(Service::new(&mut store, &instance)?);
+                Ok(Instance {
+                    store,
+                    proxy,
+                    view: ViewFn::P3(|data| {
+                        OutboundHttpFactor::get_wasi_p3_http_impl(data.factors_instance_state_mut())
+                            .unwrap()
+                    }),
+                    expiration: Expiration {
+                        sleep: Box::pin(tokio::time::sleep(Duration::MAX)),
+                    },
+                    state: Worker,
+                })
+            }
+        }
+
+        async fn run(app: Arc<App>, yield_fuel: bool) -> anyhow::Result<Completion> {
+            let (sender, receiver) = oneshot::channel();
+            let handler = ProxyHandler::new(Handler {
+                app,
+                completion: Arc::new(Mutex::new(Some(sender))),
+                yield_fuel,
+            });
+            let body = Empty::<Bytes>::new()
+                .map_err(|never: Infallible| match never {})
+                .boxed_unsync();
+            let request = http::Request::builder()
+                .method("GET")
+                .uri("http://localhost/cpu")
+                .body(body)?;
+            let result = tokio::time::timeout(Duration::from_secs(3), handler.handle((), request))
+                .await
+                .context("P3 CPU request exceeded its outer bound")?;
+            anyhow::ensure!(result.is_err(), "P3 CPU request unexpectedly returned");
+            tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .context("terminal store was not observed")?
+                .context("completion observer dropped")
+        }
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let component = test_components::path("integration-wasi-http-p3-streaming")
+                .context("missing final-P3 test component")?;
+            let manifest = format!(
+                r#"
+spin_manifest_version = 2
+
+[application]
+name = "p3-completion-regression"
+version = "1.0.0"
+
+[[trigger.http]]
+route = "/..."
+component = "wasi-http-async"
+
+[component.wasi-http-async]
+source = {component:?}
+"#
+            );
+            let manifest_path = directory.path().join("spin.toml");
+            std::fs::write(&manifest_path, manifest)?;
+            let locked = spin_loader::from_file(
+                &manifest_path,
+                spin_loader::FilesMountStrategy::Direct,
+                None,
+                None,
+            )
+            .await?;
+            let app = spin_app::App::new("p3-completion-regression", locked);
+            let trigger = HttpTrigger::new(
+                &app,
+                "127.0.0.1:0".parse()?,
+                None,
+                false,
+                None,
+                InstanceReuseConfig::default(),
+                OutputFormat::default(),
+            )?;
+            let mut builder = TriggerAppBuilder::<_, FactorsBuilder>::new(trigger);
+            builder.engine_config().wasmtime_config().consume_fuel(true);
+            let app = Arc::new(
+                builder
+                    .build(
+                        app,
+                        FactorsConfig {
+                            working_dir: directory.path().to_owned(),
+                            ..Default::default()
+                        },
+                        TriggerAppArgs::default(),
+                        &ComponentLoader::new(),
+                    )
+                    .await?,
+            );
+
+            let yielded = run(app.clone(), true).await?;
+            let no_yield = run(app, false).await?;
+
+            for completion in [&yielded, &no_yield] {
+                anyhow::ensure!(
+                    completion
+                        .remaining_fuel
+                        .is_some_and(|remaining| (1..INITIAL_FUEL).contains(&remaining))
+                );
+            }
+            anyhow::ensure!(!yielded.interrupted);
+            anyhow::ensure!(yielded.error.contains("guest timed out"));
+            anyhow::ensure!(yielded.wall < EPOCH_BACKSTOP);
+            anyhow::ensure!(no_yield.interrupted);
+            anyhow::ensure!(!no_yield.error.contains("guest timed out"));
+            anyhow::ensure!(no_yield.wall >= EPOCH_BACKSTOP);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn http_request_deadline_interrupts_wasip2_loop() -> anyhow::Result<()> {
         use spin_trigger_http::InstanceReuseConfig;
         use std::time::{Duration, Instant};
