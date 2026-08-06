@@ -211,6 +211,10 @@ pub struct MemoryFilesystemRuntimeConfig {
     /// permanently empty read-only filesystem serves no purpose.
     #[serde(default = "default_true")]
     pub writable: bool,
+    /// The most content, in bytes, the tree will hold before writes fail
+    /// with `insufficient-space`. Defaults to 256 MiB.
+    #[serde(default)]
+    pub maximum_size: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -225,8 +229,12 @@ impl MakeFilesystem for MemoryFilesystemMaker {
         &self,
         runtime_config: Self::RuntimeConfig,
     ) -> anyhow::Result<FilesystemDefinition> {
+        let filesystem = match runtime_config.maximum_size {
+            Some(bytes) => MemoryFilesystem::with_budget(bytes),
+            None => MemoryFilesystem::new(),
+        };
         Ok(FilesystemDefinition {
-            filesystem: Arc::new(MemoryFilesystem::new()),
+            filesystem: Arc::new(filesystem),
             writable: runtime_config.writable,
         })
     }

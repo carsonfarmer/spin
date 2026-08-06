@@ -165,6 +165,7 @@ filesystems = [{ label = "repos", path = "/srv/git" }]
 # runtime-config.toml
 [filesystem.repos]
 type = "memory"
+maximum_size = 268435456  # optional; content budget in bytes, default 256 MiB
 
 # or
 [filesystem.repos]

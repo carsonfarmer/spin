@@ -26,6 +26,15 @@ const ROOT: u64 = 1;
 /// How many symbolic links may be traversed while resolving one path.
 const SYMLINK_LIMIT: usize = 32;
 
+/// The default content budget: 256 MiB.
+pub const DEFAULT_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The default cap on the number of nodes (files, directories, symlinks).
+const DEFAULT_MAX_NODES: usize = 1 << 17;
+
+/// The longest permitted name component, as POSIX `NAME_MAX`.
+const NAME_MAX: usize = 255;
+
 /// An in-memory filesystem.
 ///
 /// Cloning is shallow: clones share the same tree.
@@ -41,8 +50,24 @@ impl Default for MemoryFilesystem {
 }
 
 impl MemoryFilesystem {
-    /// Creates an empty filesystem containing only a root directory.
+    /// Creates an empty filesystem containing only a root directory, with the
+    /// default content budget of [`DEFAULT_MEMORY_BUDGET`] bytes.
     pub fn new() -> Self {
+        Self::with_budget(DEFAULT_MEMORY_BUDGET)
+    }
+
+    /// Creates an empty filesystem whose content - file bytes and symlink
+    /// targets - may not exceed `budget` bytes.
+    ///
+    /// The budget is what makes an untrusted guest's `set-size`, `write`, and
+    /// `append` safe to expose: growth beyond it fails with
+    /// `insufficient-space` instead of consuming host memory. A cap on node
+    /// count and POSIX's `NAME_MAX` bound the bookkeeping around the content.
+    pub fn with_budget(budget: u64) -> Self {
+        Self::with_limits(budget, DEFAULT_MAX_NODES)
+    }
+
+    fn with_limits(budget: u64, max_nodes: usize) -> Self {
         let mut nodes = HashMap::new();
         let mut root = Node::new_dir();
         // The root is never the target of `link`/`unlink`, so its count is
@@ -53,6 +78,9 @@ impl MemoryFilesystem {
             inner: Arc::new(RwLock::new(Tree {
                 nodes,
                 next_inode: ROOT + 1,
+                used: 0,
+                budget,
+                max_nodes,
             })),
         }
     }
@@ -72,8 +100,20 @@ impl MemoryFilesystem {
             for (path, contents) in files {
                 let path = FsPath::new(path.as_ref())?;
                 let (parent, name) = tree.resolve_parent_creating(path)?;
-                let inode = tree.alloc(Node::new_file(contents.into()));
-                tree.link(parent, &name, inode)?;
+                let contents: Vec<u8> = contents.into();
+                let len = contents.len();
+                tree.charge(len)?;
+                let inode = match tree.alloc(Node::new_file(contents)) {
+                    Ok(inode) => inode,
+                    Err(err) => {
+                        tree.credit(len);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = tree.link(parent, &name, inode) {
+                    tree.collect(inode);
+                    return Err(err);
+                }
             }
         }
         Ok(fs)
@@ -111,8 +151,11 @@ impl Filesystem for MemoryFilesystem {
                     if opts.open_flags.contains(OpenFlags::DIRECTORY) {
                         return Err(ErrorCode::NoEntry);
                     }
-                    let inode = tree.alloc(Node::new_file(Vec::new()));
-                    tree.link(dir, &name, inode)?;
+                    let inode = tree.alloc(Node::new_file(Vec::new()))?;
+                    if let Err(err) = tree.link(dir, &name, inode) {
+                        tree.collect(inode);
+                        return Err(err);
+                    }
                     inode
                 }
             }
@@ -145,11 +188,15 @@ impl Filesystem for MemoryFilesystem {
                 if opts.open_flags.contains(OpenFlags::TRUNCATE) {
                     let now = SystemTime::now();
                     let node = tree.node_mut(inode)?;
+                    let mut freed = 0;
                     if let NodeKind::File(contents) = &mut node.kind {
+                        freed = contents.len();
                         contents.clear();
+                        contents.shrink_to_fit();
                     }
                     node.mtime = now;
                     node.ctime = now;
+                    tree.credit(freed);
                 }
                 tree.node_mut(inode)?.open_handles += 1;
                 Ok(Opened::File(Arc::new(MemoryFile {
@@ -196,8 +243,12 @@ impl Filesystem for MemoryFilesystem {
         if tree.child(parent, &name)?.is_some() {
             return Err(ErrorCode::Exist);
         }
-        let inode = tree.alloc(Node::new_dir());
-        tree.link(parent, &name, inode)
+        let inode = tree.alloc(Node::new_dir())?;
+        if let Err(err) = tree.link(parent, &name, inode) {
+            tree.collect(inode);
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn remove_dir(&self, path: &FsPath) -> FsResult<()> {
@@ -279,8 +330,19 @@ impl Filesystem for MemoryFilesystem {
         if tree.child(parent, &name)?.is_some() {
             return Err(ErrorCode::Exist);
         }
-        let inode = tree.alloc(Node::new_symlink(target.to_owned()));
-        tree.link(parent, &name, inode)
+        tree.charge(target.len())?;
+        let inode = match tree.alloc(Node::new_symlink(target.to_owned())) {
+            Ok(inode) => inode,
+            Err(err) => {
+                tree.credit(target.len());
+                return Err(err);
+            }
+        };
+        if let Err(err) = tree.link(parent, &name, inode) {
+            tree.collect(inode);
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn readlink(&self, path: &FsPath) -> FsResult<String> {
@@ -360,15 +422,25 @@ impl File for MemoryFile {
 
     async fn write_at(&self, buf: &[u8], offset: u64) -> FsResult<usize> {
         let mut tree = self.fs.write();
-        let now = SystemTime::now();
-        let node = tree.node_mut(self.inode)?;
-        let NodeKind::File(contents) = &mut node.kind else {
-            return Err(ErrorCode::BadDescriptor);
-        };
         let offset = usize::try_from(offset).map_err(|_| ErrorCode::FileTooLarge)?;
         let end = offset
             .checked_add(buf.len())
             .ok_or(ErrorCode::FileTooLarge)?;
+        // Budget first: the charge is refused - and nothing is allocated -
+        // when a hostile offset or size would overcommit the tree.
+        let grow = end.saturating_sub(self.contents(&tree)?.len());
+        if grow > 0 {
+            tree.charge(grow)?;
+        }
+        let now = SystemTime::now();
+        let node = tree.node_mut(self.inode).expect("probed by contents()");
+        let NodeKind::File(contents) = &mut node.kind else {
+            unreachable!("probed as a file by contents()");
+        };
+        if grow > 0 && contents.try_reserve(grow).is_err() {
+            tree.credit(grow);
+            return Err(ErrorCode::InsufficientSpace);
+        }
         if end > contents.len() {
             // Writing past the end zero-fills the gap, as WASI requires.
             contents.resize(end, 0);
@@ -381,11 +453,17 @@ impl File for MemoryFile {
 
     async fn append(&self, buf: &[u8]) -> FsResult<usize> {
         let mut tree = self.fs.write();
+        self.contents(&tree)?;
+        tree.charge(buf.len())?;
         let now = SystemTime::now();
-        let node = tree.node_mut(self.inode)?;
+        let node = tree.node_mut(self.inode).expect("probed by contents()");
         let NodeKind::File(contents) = &mut node.kind else {
-            return Err(ErrorCode::BadDescriptor);
+            unreachable!("probed as a file by contents()");
         };
+        if contents.try_reserve(buf.len()).is_err() {
+            tree.credit(buf.len());
+            return Err(ErrorCode::InsufficientSpace);
+        }
         contents.extend_from_slice(buf);
         node.mtime = now;
         node.ctime = now;
@@ -399,15 +477,33 @@ impl File for MemoryFile {
 
     async fn set_size(&self, size: u64) -> FsResult<()> {
         let mut tree = self.fs.write();
-        let now = SystemTime::now();
-        let node = tree.node_mut(self.inode)?;
-        let NodeKind::File(contents) = &mut node.kind else {
-            return Err(ErrorCode::BadDescriptor);
-        };
         let size = usize::try_from(size).map_err(|_| ErrorCode::FileTooLarge)?;
-        contents.resize(size, 0);
+        let old = self.contents(&tree)?.len();
+        if size > old {
+            tree.charge(size - old)?;
+        }
+        let now = SystemTime::now();
+        let node = tree.node_mut(self.inode).expect("probed by contents()");
+        let NodeKind::File(contents) = &mut node.kind else {
+            unreachable!("probed as a file by contents()");
+        };
+        if size > old {
+            if contents.try_reserve(size - old).is_err() {
+                tree.credit(size - old);
+                return Err(ErrorCode::InsufficientSpace);
+            }
+            contents.resize(size, 0);
+        } else {
+            contents.truncate(size);
+            // Release the capacity too: the budget tracks logical bytes, so
+            // freed bytes must actually be free.
+            contents.shrink_to_fit();
+        }
         node.mtime = now;
         node.ctime = now;
+        if size < old {
+            tree.credit(old - size);
+        }
         Ok(())
     }
 
@@ -440,6 +536,12 @@ impl File for MemoryFile {
 struct Tree {
     nodes: HashMap<u64, Node>,
     next_inode: u64,
+    /// Bytes of content - file bytes and symlink targets - currently stored.
+    used: u64,
+    /// Content bytes the tree may hold; growth beyond this is refused.
+    budget: u64,
+    /// Nodes the tree may hold, bounding bookkeeping memory.
+    max_nodes: usize,
 }
 
 /// The result of a [`Tree::walk`].
@@ -460,11 +562,32 @@ impl Tree {
         self.nodes.get_mut(&inode).ok_or(ErrorCode::NoEntry)
     }
 
-    fn alloc(&mut self, node: Node) -> u64 {
+    /// Reserves `bytes` of the content budget, refusing to overcommit.
+    fn charge(&mut self, bytes: usize) -> FsResult<()> {
+        let used = self
+            .used
+            .checked_add(bytes as u64)
+            .ok_or(ErrorCode::InsufficientSpace)?;
+        if used > self.budget {
+            return Err(ErrorCode::InsufficientSpace);
+        }
+        self.used = used;
+        Ok(())
+    }
+
+    /// Returns `bytes` of the content budget.
+    fn credit(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes as u64);
+    }
+
+    fn alloc(&mut self, node: Node) -> FsResult<u64> {
+        if self.nodes.len() >= self.max_nodes {
+            return Err(ErrorCode::InsufficientSpace);
+        }
         let inode = self.next_inode;
         self.next_inode += 1;
         self.nodes.insert(inode, node);
-        inode
+        Ok(inode)
     }
 
     fn child(&self, dir: u64, name: &str) -> FsResult<Option<u64>> {
@@ -493,6 +616,9 @@ impl Tree {
 
     /// Adds a directory entry without touching link counts.
     fn attach(&mut self, dir: u64, name: &str, inode: u64) -> FsResult<()> {
+        if name.len() > NAME_MAX {
+            return Err(ErrorCode::NameTooLong);
+        }
         let now = SystemTime::now();
         let node = self.node_mut(dir)?;
         let NodeKind::Dir(entries) = &mut node.kind else {
@@ -527,7 +653,8 @@ impl Tree {
             && node.links == 0
             && node.open_handles == 0
         {
-            self.nodes.remove(&inode);
+            let node = self.nodes.remove(&inode).expect("observed just above");
+            self.credit(node.content_bytes());
         }
     }
 
@@ -664,8 +791,11 @@ impl Tree {
             current = match self.child(current, parent)? {
                 Some(inode) => inode,
                 None => {
-                    let inode = self.alloc(Node::new_dir());
-                    self.link(current, parent, inode)?;
+                    let inode = self.alloc(Node::new_dir())?;
+                    if let Err(err) = self.link(current, parent, inode) {
+                        self.collect(inode);
+                        return Err(err);
+                    }
                     inode
                 }
             };
@@ -689,6 +819,17 @@ enum NodeKind {
     Dir(BTreeMap<String, u64>),
     File(Vec<u8>),
     Symlink(String),
+}
+
+impl Node {
+    /// The bytes this node holds against the content budget.
+    fn content_bytes(&self) -> usize {
+        match &self.kind {
+            NodeKind::Dir(_) => 0,
+            NodeKind::File(contents) => contents.len(),
+            NodeKind::Symlink(target) => target.len(),
+        }
+    }
 }
 
 impl Node {
@@ -760,5 +901,122 @@ impl Node {
         if !times.is_noop() {
             self.ctime = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(path: &str) -> &FsPath {
+        FsPath::new(path).unwrap()
+    }
+
+    async fn create(fs: &MemoryFilesystem, path: &str) -> Arc<dyn File> {
+        match fs
+            .open(
+                p(path),
+                OpenOptions {
+                    open_flags: OpenFlags::CREATE,
+                    flags: DescriptorFlags::READ | DescriptorFlags::WRITE,
+                    follow_symlinks: true,
+                },
+            )
+            .await
+            .unwrap()
+        {
+            Opened::File(file) => file,
+            Opened::Dir => panic!("expected a file"),
+        }
+    }
+
+    /// The attack that motivated the budget: one hostile `set-size` call.
+    /// Without the budget this aborts the process on allocation failure.
+    #[tokio::test]
+    async fn hostile_set_size_is_refused_not_allocated() {
+        let fs = MemoryFilesystem::with_limits(1024, 16);
+        let file = create(&fs, "f").await;
+        assert_eq!(
+            file.set_size(4 << 50).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        assert_eq!(
+            file.set_size(2048).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        file.set_size(512).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostile_write_offset_is_refused() {
+        let fs = MemoryFilesystem::with_limits(1024, 16);
+        let file = create(&fs, "f").await;
+        assert_eq!(
+            file.write_at(b"x", 1 << 40).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        assert_eq!(
+            file.append(&[0; 2048]).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_is_reclaimed_by_shrink_and_unlink() {
+        let fs = MemoryFilesystem::with_limits(1024, 16);
+        let file = create(&fs, "a").await;
+        file.set_size(1024).await.unwrap();
+        // Full: nothing left for another byte anywhere.
+        let other = create(&fs, "b").await;
+        assert_eq!(
+            other.append(b"x").await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        // Shrinking frees...
+        file.set_size(512).await.unwrap();
+        other.append(&[0; 512]).await.unwrap();
+        // ...and so does unlinking, once the handle is gone.
+        drop(file);
+        fs.unlink(p("a")).await.unwrap();
+        other.append(&[0; 512]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn symlink_targets_count_against_the_budget() {
+        let fs = MemoryFilesystem::with_limits(64, 16);
+        fs.symlink(&"t".repeat(65), p("l")).await.unwrap_err();
+        fs.symlink(&"t".repeat(64), p("l")).await.unwrap();
+        assert_eq!(
+            fs.symlink("x", p("m")).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        fs.unlink(p("l")).await.unwrap();
+        fs.symlink("x", p("m")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_count_is_capped() {
+        // Root plus three nodes fit; a fourth does not.
+        let fs = MemoryFilesystem::with_limits(1024, 4);
+        create(&fs, "a").await;
+        fs.create_dir(p("d")).await.unwrap();
+        create(&fs, "d/b").await;
+        assert_eq!(
+            fs.create_dir(p("e")).await.unwrap_err(),
+            ErrorCode::InsufficientSpace
+        );
+        // Reclaiming a node makes room again.
+        fs.unlink(p("a")).await.unwrap();
+        fs.create_dir(p("e")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn names_longer_than_name_max_are_refused() {
+        let fs = MemoryFilesystem::new();
+        assert_eq!(
+            fs.create_dir(p(&"n".repeat(256))).await.unwrap_err(),
+            ErrorCode::NameTooLong
+        );
+        fs.create_dir(p(&"n".repeat(255))).await.unwrap();
     }
 }
