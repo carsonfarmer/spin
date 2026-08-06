@@ -152,11 +152,29 @@ impl Descriptor {
     }
 
     /// Validates `rel` and joins it onto this descriptor's path.
+    ///
+    /// The base descriptor is a sandbox boundary of its own: `wasi:filesystem`
+    /// specifies that a path reaching outside the base directory fails with
+    /// `not-permitted`, even when it would land inside the mount. `..` is
+    /// checked lexically here, so `sub/../x` is fine while `../x` and
+    /// `a/../../x` are refused; a `..` introduced *by a symlink target* is
+    /// resolved by the backend, whose own confinement is the mount root.
     fn join(&self, rel: &str) -> FsResult<FsPathBuf> {
         let rel = FsPath::new(rel)?;
         if rel.as_str().is_empty() {
             // POSIX: an empty path in any `*at` call is `ENOENT`.
             return Err(ErrorCode::NoEntry);
+        }
+        let mut depth = 0i64;
+        for component in rel.components() {
+            if component == ".." {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(ErrorCode::NotPermitted);
+                }
+            } else {
+                depth += 1;
+            }
         }
         if self.path.is_root() {
             Ok(rel.to_owned())
@@ -566,6 +584,38 @@ mod tests {
             desc.write(contents, 0).await.unwrap();
         }
         desc
+    }
+
+    /// `wasi:filesystem`: a path that reaches outside the *base descriptor*
+    /// fails with `not-permitted`, even when it stays inside the mount.
+    #[tokio::test]
+    async fn dotdot_is_confined_to_the_base_descriptor() {
+        let root = mount(true);
+        root.create_directory_at("sub").await.unwrap();
+        create(&root, "secret.txt", b"top").await;
+        let sub = root
+            .open_at(
+                "sub",
+                true,
+                OpenFlags::DIRECTORY,
+                DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+            )
+            .await
+            .unwrap();
+
+        for path in ["../secret.txt", "x/../../secret.txt", ".."] {
+            assert_eq!(
+                sub.stat_at(path, true).await.unwrap_err(),
+                ErrorCode::NotPermitted,
+                "stat {path}"
+            );
+        }
+        // `..` that stays at or below the base is fine.
+        sub.create_directory_at("x").await.unwrap();
+        assert!(sub.stat_at("x/..", true).await.is_ok());
+
+        // And the root descriptor itself can still use interior `..`.
+        assert!(root.stat_at("sub/..", true).await.is_ok());
     }
 
     #[tokio::test]

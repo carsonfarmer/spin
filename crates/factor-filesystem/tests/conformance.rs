@@ -233,7 +233,7 @@ mod cases {
 
     pub(crate) async fn hard_links_share_content_and_link_count(fs: &dyn Filesystem) {
         create(fs, "a", b"hi").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
         assert_eq!(fs.stat_at(p("a"), true).await.unwrap().link_count, 2);
         assert_eq!(fs.stat_at(p("b"), true).await.unwrap().link_count, 2);
         assert_eq!(read_file(fs, "b").await, b"hi");
@@ -249,7 +249,7 @@ mod cases {
         // Linking on top of an existing name is refused.
         create(fs, "c", b"").await;
         assert_eq!(
-            fs.hard_link(p("a"), true, p("c")).await.unwrap_err(),
+            fs.hard_link(p("a"), false, p("c")).await.unwrap_err(),
             ErrorCode::Exist
         );
 
@@ -305,7 +305,7 @@ mod cases {
 
     pub(crate) async fn rename_between_hard_links_is_noop(fs: &dyn Filesystem) {
         create(fs, "a", b"x").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
 
         // POSIX: renaming a name onto another name for the same object does
         // nothing - and in particular does not remove the source name.
@@ -582,7 +582,7 @@ mod cases {
     pub(crate) async fn object_identity(fs: &dyn Filesystem) {
         create(fs, "a", b"one").await;
         create(fs, "other", b"two").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
 
         let a = fs.object_id_at(p("a"), true).await.unwrap();
         let b = fs.object_id_at(p("b"), true).await.unwrap();

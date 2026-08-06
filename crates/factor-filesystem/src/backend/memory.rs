@@ -59,10 +59,10 @@ impl MemoryFilesystem {
     /// Creates an empty filesystem whose content - file bytes and symlink
     /// targets - may not exceed `budget` bytes.
     ///
-    /// The budget is what makes an untrusted guest's `set-size`, `write`, and
-    /// `append` safe to expose: growth beyond it fails with
-    /// `insufficient-space` instead of consuming host memory. A cap on node
-    /// count and POSIX's `NAME_MAX` bound the bookkeeping around the content.
+    /// The budget keeps guest-driven growth within known bounds: `set-size`,
+    /// `write`, and `append` past it fail with `insufficient-space` instead
+    /// of allocating host memory. A cap on node count and POSIX's `NAME_MAX`
+    /// bound the bookkeeping around the content.
     pub fn with_budget(budget: u64) -> Self {
         Self::with_limits(budget, DEFAULT_MAX_NODES)
     }
@@ -138,6 +138,7 @@ impl Filesystem for MemoryFilesystem {
         let mut tree = self.write();
 
         let creating = opts.open_flags.contains(OpenFlags::CREATE);
+        let want_dir_spelling = path.requires_directory();
         let inode = if creating {
             // O_CREAT|O_EXCL does not follow a final symlink: a link there -
             // even a dangling one - means "the path exists".
@@ -150,6 +151,11 @@ impl Filesystem for MemoryFilesystem {
                 Lookup::Missing { dir, name } => {
                     if opts.open_flags.contains(OpenFlags::DIRECTORY) {
                         return Err(ErrorCode::NoEntry);
+                    }
+                    if want_dir_spelling {
+                        // `open("newdir/", O_CREAT)` may not create a regular
+                        // file; POSIX reports `EISDIR`.
+                        return Err(ErrorCode::IsDirectory);
                     }
                     let inode = tree.alloc(Node::new_file(Vec::new()))?;
                     if let Err(err) = tree.link(dir, &name, inode) {
@@ -166,16 +172,20 @@ impl Filesystem for MemoryFilesystem {
         let node = tree.node(inode)?;
         match &node.kind {
             NodeKind::Dir(_) => {
-                // Directories can be opened for mutation - that is
-                // `mutate-directory`, carried in `flags` - but not for writing
-                // bytes.
-                if opts.flags.contains(DescriptorFlags::WRITE)
+                // POSIX: `O_CREAT|O_EXCL` on an existing directory is
+                // `EEXIST` (handled by the walk above); plain `O_CREAT` is
+                // `EISDIR`. Directories can otherwise be opened for mutation
+                // - that is `mutate-directory`, carried in `flags` - but not
+                // for writing bytes.
+                if creating
+                    || opts.flags.contains(DescriptorFlags::WRITE)
                     || opts.open_flags.contains(OpenFlags::TRUNCATE)
                 {
                     return Err(ErrorCode::IsDirectory);
                 }
                 Ok(Opened::Dir)
             }
+            _ if want_dir_spelling => Err(ErrorCode::NotDirectory),
             NodeKind::Symlink(_) => {
                 // We only get here with `follow_symlinks` false, which is
                 // `O_NOFOLLOW`; POSIX reports that as `ELOOP`.
@@ -422,12 +432,18 @@ impl File for MemoryFile {
 
     async fn write_at(&self, buf: &[u8], offset: u64) -> FsResult<usize> {
         let mut tree = self.fs.write();
+        if buf.is_empty() {
+            // POSIX: a zero-length `pwrite` detects errors but neither
+            // extends the file nor touches its timestamps.
+            self.contents(&tree)?;
+            return Ok(0);
+        }
         let offset = usize::try_from(offset).map_err(|_| ErrorCode::FileTooLarge)?;
         let end = offset
             .checked_add(buf.len())
             .ok_or(ErrorCode::FileTooLarge)?;
         // Budget first: the charge is refused - and nothing is allocated -
-        // when a hostile offset or size would overcommit the tree.
+        // when an offset or size would exceed the tree's byte budget.
         let grow = end.saturating_sub(self.contents(&tree)?.len());
         if grow > 0 {
             tree.charge(grow)?;
@@ -680,7 +696,13 @@ impl Tree {
     fn resolve(&self, path: &FsPath, follow_final: bool) -> FsResult<u64> {
         let components: Vec<&str> = path.components().collect();
         match self.walk(&components, follow_final, false)? {
-            Lookup::Exists(inode) => Ok(inode),
+            Lookup::Exists(inode) => {
+                if path.requires_directory() && !matches!(self.node(inode)?.kind, NodeKind::Dir(_))
+                {
+                    return Err(ErrorCode::NotDirectory);
+                }
+                Ok(inode)
+            }
             Lookup::Missing { .. } => Err(ErrorCode::NoEntry),
         }
     }
@@ -708,6 +730,11 @@ impl Tree {
             let current = *stack.last().expect("stack always holds at least the root");
 
             if component == ".." {
+                // `f/..` must fail like `f/x` would: resolution does not
+                // pass *through* a non-directory in either direction.
+                if !matches!(self.node(current)?.kind, NodeKind::Dir(_)) {
+                    return Err(ErrorCode::NotDirectory);
+                }
                 if stack.len() == 1 {
                     // Stepping above the root leaves the sandbox.
                     return Err(ErrorCode::NotPermitted);
@@ -930,10 +957,10 @@ mod tests {
         }
     }
 
-    /// The attack that motivated the budget: one hostile `set-size` call.
-    /// Without the budget this aborts the process on allocation failure.
+    /// The case that motivated the budget: a `set-size` far past available
+    /// memory returns `insufficient-space` without allocating.
     #[tokio::test]
-    async fn hostile_set_size_is_refused_not_allocated() {
+    async fn oversized_set_size_is_refused_not_allocated() {
         let fs = MemoryFilesystem::with_limits(1024, 16);
         let file = create(&fs, "f").await;
         assert_eq!(
@@ -948,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hostile_write_offset_is_refused() {
+    async fn oversized_write_offset_is_refused() {
         let fs = MemoryFilesystem::with_limits(1024, 16);
         let file = create(&fs, "f").await;
         assert_eq!(
@@ -959,6 +986,16 @@ mod tests {
             file.append(&[0; 2048]).await.unwrap_err(),
             ErrorCode::InsufficientSpace
         );
+    }
+
+    /// POSIX: a zero-length positional write is a no-op - in particular it
+    /// does not extend the file to its offset.
+    #[tokio::test]
+    async fn empty_write_does_not_extend() {
+        let fs = MemoryFilesystem::new();
+        let file = create(&fs, "f").await;
+        assert_eq!(file.write_at(b"", 1000).await.unwrap(), 0);
+        assert_eq!(file.stat().await.unwrap().size, 0);
     }
 
     #[tokio::test]

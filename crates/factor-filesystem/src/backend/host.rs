@@ -97,9 +97,14 @@ impl Filesystem for HostFilesystem {
             });
         if opts.flags.contains(DescriptorFlags::WRITE) {
             cap_opts.write(true);
-        } else if opts.open_flags.contains(OpenFlags::TRUNCATE) {
-            // `O_TRUNC` needs write access at the OS level even when the guest
-            // only asked to read the truncated file afterwards.
+        } else if opts.open_flags.contains(OpenFlags::TRUNCATE)
+            || opts.open_flags.contains(OpenFlags::CREATE)
+        {
+            // `O_TRUNC` and `O_CREAT` need write access at the OS level even
+            // when the guest only asked to read the file afterwards -
+            // `O_CREAT|O_RDONLY` is the most common creating open wasi-libc
+            // emits. What the guest may then do with the descriptor is the
+            // descriptor layer's business, not the OS handle's.
             cap_opts.write(true);
         }
         cap_opts
@@ -113,6 +118,8 @@ impl Filesystem for HostFilesystem {
         let want_dir = opts.open_flags.contains(OpenFlags::DIRECTORY);
         let want_write = opts.flags.contains(DescriptorFlags::WRITE)
             || opts.open_flags.contains(OpenFlags::TRUNCATE);
+        let create = opts.open_flags.contains(OpenFlags::CREATE);
+        let create_new = create && opts.open_flags.contains(OpenFlags::EXCLUSIVE);
         let follow = opts.follow_symlinks;
 
         let opened = self
@@ -143,6 +150,14 @@ impl Filesystem for HostFilesystem {
                 };
 
                 if is_dir {
+                    // POSIX: `O_CREAT|O_EXCL` on an existing directory is
+                    // `EEXIST`; plain `O_CREAT` is `EISDIR`.
+                    if create_new {
+                        return Ok(Err(ErrorCode::Exist));
+                    }
+                    if create {
+                        return Err(io::Error::from(io::ErrorKind::IsADirectory));
+                    }
                     if want_write {
                         return Err(io::Error::from(io::ErrorKind::IsADirectory));
                     }
@@ -219,7 +234,12 @@ impl Filesystem for HostFilesystem {
                     Err(err) => return Err(err),
                 };
                 let Ok(name) = entry.file_name().into_string() else {
-                    return Err(io::Error::other("directory entry name is not valid UTF-8"));
+                    // `wasi:filesystem` names are UTF-8; a name that is not
+                    // is `illegal-byte-sequence`, as wasmtime-wasi reports.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name is not valid UTF-8",
+                    ));
                 };
                 let type_ = entry.metadata()?.file_type();
                 out.push(DirEntry {
@@ -277,11 +297,14 @@ impl Filesystem for HostFilesystem {
     }
 
     async fn hard_link(&self, from: &FsPath, follow: bool, to: &FsPath) -> FsResult<()> {
-        if !follow {
-            // `cap-std` has no `linkat` without `AT_SYMLINK_FOLLOW`, and
-            // hard-linking a symlink itself is exotic enough that reporting it
-            // as unsupported is better than silently following.
-            return Err(ErrorCode::Unsupported);
+        if follow {
+            // `cap-std` only exposes `linkat` without `AT_SYMLINK_FOLLOW`
+            // (its `hard_link` links the final path object itself, symlink or
+            // not). Following the source first cannot be done atomically, so
+            // report `invalid` - which is also what wasmtime-wasi does, and
+            // harmless in practice: wasi-libc's `link()` always passes
+            // `follow: false`.
+            return Err(ErrorCode::Invalid);
         }
         let from = from.as_std_path().to_owned();
         let to = to.as_std_path().to_owned();

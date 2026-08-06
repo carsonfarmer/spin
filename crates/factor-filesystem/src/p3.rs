@@ -256,9 +256,9 @@ fn advice_from(advice: types::Advice) -> Advice {
 }
 
 fn instant_to(time: SystemTime) -> Option<system_clock::Instant> {
-    // `instant` has signed seconds, so pre-epoch timestamps are
-    // representable, but backends hand us `SystemTime` which is easiest to
-    // split by direction.
+    // `wasi:clocks` `instant` uses a floor convention: `seconds` is the
+    // floor and `nanoseconds` always counts forward from it, so one
+    // nanosecond before the epoch is `{-1, 999_999_999}`, not `{0, -1}`.
     match time.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(after) => Some(system_clock::Instant {
             seconds: after.as_secs().try_into().ok()?,
@@ -266,9 +266,17 @@ fn instant_to(time: SystemTime) -> Option<system_clock::Instant> {
         }),
         Err(err) => {
             let before = err.duration();
-            Some(system_clock::Instant {
-                seconds: i64::try_from(before.as_secs()).ok().map(|s| -s)?,
-                nanoseconds: before.subsec_nanos(),
+            let seconds = i64::try_from(before.as_secs()).ok()?;
+            Some(if before.subsec_nanos() == 0 {
+                system_clock::Instant {
+                    seconds: seconds.checked_neg()?,
+                    nanoseconds: 0,
+                }
+            } else {
+                system_clock::Instant {
+                    seconds: seconds.checked_add(1)?.checked_neg()?,
+                    nanoseconds: 1_000_000_000 - before.subsec_nanos(),
+                }
             })
         }
     }
@@ -278,16 +286,16 @@ fn systemtime_from(instant: system_clock::Instant) -> FsResult<SystemTime> {
     if instant.nanoseconds >= 1_000_000_000 {
         return Err(ErrorCode::Invalid.into());
     }
+    // Mirror the floor convention: the instant is `seconds + nanoseconds`,
+    // with `nanoseconds` counting forward even when `seconds` is negative.
     if let Ok(seconds) = u64::try_from(instant.seconds) {
         SystemTime::UNIX_EPOCH
             .checked_add(std::time::Duration::new(seconds, instant.nanoseconds))
             .ok_or_else(|| ErrorCode::Overflow.into())
     } else {
         SystemTime::UNIX_EPOCH
-            .checked_sub(std::time::Duration::new(
-                instant.seconds.unsigned_abs(),
-                instant.nanoseconds,
-            ))
+            .checked_sub(std::time::Duration::new(instant.seconds.unsigned_abs(), 0))
+            .and_then(|floor| floor.checked_add(std::time::Duration::new(0, instant.nanoseconds)))
             .ok_or_else(|| ErrorCode::Overflow.into())
     }
 }
@@ -1041,6 +1049,28 @@ mod tests {
             assert_eq!(instant.seconds, offset, "offset {offset}");
             assert_eq!(systemtime_from(instant).expect("valid"), time);
         }
+    }
+
+    /// `wasi:clocks` encodes sub-second pre-epoch instants with floored
+    /// seconds and forward-counting nanoseconds: 1ns before the epoch is
+    /// `{-1, 999_999_999}`.
+    #[test]
+    fn pre_epoch_instants_use_the_floor_convention() {
+        let time = SystemTime::UNIX_EPOCH - Duration::new(0, 1);
+        let instant = instant_to(time).expect("representable");
+        assert_eq!((instant.seconds, instant.nanoseconds), (-1, 999_999_999));
+        assert_eq!(systemtime_from(instant).expect("valid"), time);
+
+        let time = SystemTime::UNIX_EPOCH - Duration::new(1, 500_000_000);
+        let instant = instant_to(time).expect("representable");
+        assert_eq!((instant.seconds, instant.nanoseconds), (-2, 500_000_000));
+        assert_eq!(systemtime_from(instant).expect("valid"), time);
+
+        // And nanoseconds forward from a negative floor land where they say.
+        let time = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        let instant = instant_to(time).expect("representable");
+        assert_eq!((instant.seconds, instant.nanoseconds), (-1, 0));
+        assert_eq!(systemtime_from(instant).expect("valid"), time);
     }
 
     #[test]

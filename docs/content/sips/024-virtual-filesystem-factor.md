@@ -230,6 +230,25 @@ the working set has to fit on local disk.
 **A Spin-specific filesystem interface next to `wasi:filesystem`.** Defeats the entire
 purpose. The value here is that unmodified `gitoxide` runs on it.
 
+# Known behavioural differences
+
+Three places where this design knowingly reads differently from `wasmtime-wasi`'s
+descriptor-per-dirfd model, all reviewed and accepted:
+
+- **Directory descriptors are path-identified.** A directory descriptor is
+  `(filesystem, path)` re-resolved per operation, not a held kernel handle. Renaming or
+  removing a directory therefore invalidates descriptors that were opened into it (they
+  report `no-entry`), where a real dirfd would keep working. This is what makes the SPI
+  implementable by backends without kernel handles (memory today; object stores next).
+- **Mounts are distinct devices.** `rename-at`/`link-at` across two mounts report
+  `cross-device`, even when both are host mounts on one disk. Guests already handle
+  `EXDEV` (falling back to copy) because POSIX allows it between any two paths.
+- **A dropped output stream may cut short a buffered multi-chunk write.** Closing or
+  flushing before drop - which is what wasi-libc's `fclose`/`fflush` do - always
+  completes the write. `wasmtime-wasi` lets an in-flight chunk finish in the background;
+  the difference is observable only by dropping a stream with unflushed data, where no
+  durability was promised.
+
 # Future work
 
 - An object-storage backend (S3/R2/GCS) with the write-combining and prefix-listing that

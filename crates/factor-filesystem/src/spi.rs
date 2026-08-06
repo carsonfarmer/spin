@@ -236,6 +236,16 @@ impl FsPath {
         self.0.split('/').filter(|c| !c.is_empty() && *c != ".")
     }
 
+    /// True if the path's spelling requires the final object to be a
+    /// directory: a trailing `/`, `/.`, or a lone `.`.
+    ///
+    /// POSIX gives `ENOTDIR` when such a path names a regular file. Backends
+    /// that resolve paths themselves check this after their walk; the host
+    /// backend's operating system enforces it natively.
+    pub fn requires_directory(&self) -> bool {
+        self.0.ends_with('/') || self.0.ends_with("/.") || &self.0 == "."
+    }
+
     /// This path as a relative [`std::path::Path`].
     pub fn as_std_path(&self) -> &std::path::Path {
         std::path::Path::new(if self.is_root() { "." } else { &self.0 })
@@ -717,6 +727,7 @@ impl From<&std::io::Error> for ErrorCode {
             ErrorKind::ExecutableFileBusy => Self::TextFileBusy,
             ErrorKind::Deadlock => Self::Deadlock,
             ErrorKind::InvalidFilename => Self::NameTooLong,
+            ErrorKind::InvalidData => Self::IllegalByteSequence,
             _ => Self::Io,
         }
     }
