@@ -1058,21 +1058,21 @@ mod tests {
             types::DescriptorType::from(DescriptorType::Unknown),
             types::DescriptorType::Other(None)
         ));
-        assert_eq!(
+        assert!(matches!(
             types::DescriptorType::from(DescriptorType::Directory),
             types::DescriptorType::Directory
-        );
+        ));
     }
 
     #[test]
     fn would_block_degrades_to_io() {
-        assert_eq!(
+        assert!(matches!(
             types::ErrorCode::from(ErrorCode::WouldBlock),
             types::ErrorCode::Io
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             types::ErrorCode::from(ErrorCode::ReadOnly),
             types::ErrorCode::ReadOnly
-        );
+        ));
     }
 }

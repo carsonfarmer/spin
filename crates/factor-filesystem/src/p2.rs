@@ -46,14 +46,14 @@ mod bindings {
                 package spin:filesystem-host;
 
                 world filesystem-host {
-                    import wasi:filesystem/types@0.2.6;
-                    import wasi:filesystem/preopens@0.2.6;
+                    import wasi:filesystem/types@0.2.12;
+                    import wasi:filesystem/preopens@0.2.12;
                 }
             "#,
             path: "../../wit",
             imports: { default: async | trappable },
             trappable_error_type: {
-                "wasi:filesystem/types@0.2.6.error-code" => crate::p2::FsError,
+                "wasi:filesystem/types@0.2.12.error-code" => crate::p2::FsError,
             },
             with: {
                 "wasi:io/poll": wasmtime_wasi_io::bindings::wasi::io::poll,
@@ -65,8 +65,8 @@ mod bindings {
             require_store_data_send: true,
         });
     }
-    pub use generated::wasi::clocks0_2_6::wall_clock;
-    pub use generated::wasi::filesystem0_2_6::{preopens, types};
+    pub use generated::wasi::clocks0_2_12::wall_clock;
+    pub use generated::wasi::filesystem0_2_12::{preopens, types};
 }
 
 pub use bindings::wall_clock;
