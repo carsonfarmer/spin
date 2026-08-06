@@ -249,7 +249,7 @@ pub mod cases {
 
     pub async fn hard_links_share_content_and_link_count(fs: &dyn Filesystem) {
         create(fs, "a", b"hi").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
         assert_eq!(fs.stat_at(p("a"), true).await.unwrap().link_count, 2);
         assert_eq!(fs.stat_at(p("b"), true).await.unwrap().link_count, 2);
         assert_eq!(read_file(fs, "b").await, b"hi");
@@ -265,7 +265,7 @@ pub mod cases {
         // Linking on top of an existing name is refused.
         create(fs, "c", b"").await;
         assert_eq!(
-            fs.hard_link(p("a"), true, p("c")).await.unwrap_err(),
+            fs.hard_link(p("a"), false, p("c")).await.unwrap_err(),
             ErrorCode::Exist
         );
 
@@ -321,7 +321,7 @@ pub mod cases {
 
     pub async fn rename_between_hard_links_is_noop(fs: &dyn Filesystem) {
         create(fs, "a", b"x").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
 
         // POSIX: renaming a name onto another name for the same object does
         // nothing - and in particular does not remove the source name.
@@ -595,10 +595,75 @@ pub mod cases {
         );
     }
 
+    /// `create` without the `write` flag still creates: `O_CREAT|O_RDONLY`
+    /// is the most common creating open wasi-libc emits.
+    pub async fn create_without_write_flag(fs: &dyn Filesystem) {
+        open_with(fs, "f", OF::CREATE, DF::READ, true)
+            .await
+            .unwrap();
+        assert_eq!(fs.stat_at(p("f"), true).await.unwrap().size, 0);
+    }
+
+    /// `create` on an existing directory is `is-directory`; adding
+    /// `exclusive` makes it `exist`, and the directory must survive.
+    pub async fn create_on_existing_directory(fs: &dyn Filesystem) {
+        mkdir(fs, "d").await;
+        assert_eq!(
+            open_err(fs, "d", OF::CREATE, DF::READ).await,
+            ErrorCode::IsDirectory
+        );
+        assert_eq!(
+            open_err(fs, "d", OF::CREATE | OF::EXCLUSIVE, DF::READ).await,
+            ErrorCode::Exist
+        );
+        assert!(fs.stat_at(p("d"), true).await.unwrap().type_.is_dir());
+    }
+
+    /// Path resolution through a regular file - `f/..`, `f/.`, `f/`,
+    /// `f/child` - is `not-directory`, never a silent hop.
+    pub async fn path_through_file_is_not_directory(fs: &dyn Filesystem) {
+        create(fs, "f", b"").await;
+        for path in ["f/..", "f/.", "f/", "f/child"] {
+            assert_eq!(
+                fs.stat_at(p(path), true).await.unwrap_err(),
+                ErrorCode::NotDirectory,
+                "stat {path}"
+            );
+        }
+        // A directory with those suffixes is fine.
+        mkdir(fs, "d").await;
+        for path in ["d/.", "d/"] {
+            assert!(fs.stat_at(p(path), true).await.unwrap().type_.is_dir());
+        }
+    }
+
+    /// Distinct files are distinct objects, a path is stably itself, and a
+    /// handle agrees with the namespace. Link-free, so every backend - even
+    /// one without hard links - must pass it.
+    pub async fn object_identity_distinct(fs: &dyn Filesystem) {
+        create(fs, "a", b"one").await;
+        create(fs, "other", b"two").await;
+
+        let a = fs.object_id_at(p("a"), true).await.unwrap();
+        let other = fs.object_id_at(p("other"), true).await.unwrap();
+        assert_ne!(a, other, "distinct files are distinct objects");
+        assert_eq!(
+            a,
+            fs.object_id_at(p("a"), true).await.unwrap(),
+            "a path is stably the same object"
+        );
+
+        // The handle agrees with the namespace.
+        let file = open_file(fs, "a", OF::empty(), DF::READ).await.unwrap();
+        assert_eq!(file.object_id().await.unwrap(), a);
+    }
+
+    /// Hard links to one file share its object identity. Requires hard-link
+    /// support, so it grades into the portable tier.
     pub async fn object_identity(fs: &dyn Filesystem) {
         create(fs, "a", b"one").await;
         create(fs, "other", b"two").await;
-        fs.hard_link(p("a"), true, p("b")).await.unwrap();
+        fs.hard_link(p("a"), false, p("b")).await.unwrap();
 
         let a = fs.object_id_at(p("a"), true).await.unwrap();
         let b = fs.object_id_at(p("b"), true).await.unwrap();
@@ -716,8 +781,11 @@ macro_rules! conformance_core_cases {
             create_and_remove_dir,
             open_directory_semantics,
             dotdot_at_root_not_permitted,
-            object_identity,
+            object_identity_distinct,
             metadata_hash_tracks_changes,
+            create_without_write_flag,
+            create_on_existing_directory,
+            path_through_file_is_not_directory,
         );
     };
 }
@@ -730,6 +798,7 @@ macro_rules! conformance_portable_cases {
         $crate::conformance_core_cases!($fixture);
         $crate::conformance_suite!($fixture =>
             hard_links_share_content_and_link_count,
+            object_identity,
             set_times_explicit,
         );
     };
