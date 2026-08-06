@@ -8,7 +8,10 @@
 
 pub mod backend;
 pub mod descriptor;
+pub mod p2;
 pub mod spi;
+
+use wasmtime::component::{HasData, ResourceTable};
 
 pub use descriptor::{Descriptor, Preopens};
 pub use spi::{
@@ -16,3 +19,29 @@ pub use spi::{
     FsPathBuf, FsResult, MetadataHash, NewTimestamp, ObjectId, OpenFlags, OpenOptions, Opened,
     SetTimes, Stat,
 };
+
+/// The per-instance filesystem state: the mounts one component instance can
+/// see.
+#[derive(Default)]
+pub struct FilesystemCtx {
+    /// The preopened directories.
+    pub preopens: Preopens,
+}
+
+/// A mutable view of a [`FilesystemCtx`] together with the instance's
+/// resource table - the shape the wasmtime linker's data closures produce,
+/// and what the `wasi:filesystem` host implementations are written against.
+pub struct FilesystemCtxView<'a> {
+    /// The instance's filesystem state.
+    pub ctx: &'a mut FilesystemCtx,
+    /// The instance's resource table.
+    pub table: &'a mut ResourceTable,
+}
+
+/// Marker satisfying wasmtime's `HasData` for the `add_to_linker` calls of
+/// this crate's `wasi:filesystem` implementations.
+pub struct HasFilesystem;
+
+impl HasData for HasFilesystem {
+    type Data<'a> = FilesystemCtxView<'a>;
+}
