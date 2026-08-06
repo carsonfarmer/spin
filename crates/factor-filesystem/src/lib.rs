@@ -7,8 +7,10 @@
 #![deny(missing_docs)]
 
 pub mod backend;
+pub mod descriptor;
 pub mod spi;
 
+pub use descriptor::{Descriptor, Preopens};
 pub use spi::{
     Advice, DescriptorFlags, DescriptorType, DirEntry, ErrorCode, File, Filesystem, FsPath,
     FsPathBuf, FsResult, MetadataHash, NewTimestamp, ObjectId, OpenFlags, OpenOptions, Opened,
