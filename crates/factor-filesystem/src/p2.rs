@@ -38,6 +38,8 @@ use crate::spi::{
 };
 use crate::{FilesystemCtxView, p2};
 
+pub mod compat;
+
 mod bindings {
     #[allow(missing_docs, reason = "bindgen-generated")]
     mod generated {

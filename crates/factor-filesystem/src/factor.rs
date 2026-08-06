@@ -76,8 +76,36 @@ impl Factor for FilesystemFactor {
             let (ctx, table) = C::get_data_with_table(data);
             FilesystemCtxView { ctx, table }
         }
-        p2::types::add_to_linker::<_, HasFilesystem>(ctx.linker(), get_view::<T>)?;
-        p2::preopens::add_to_linker::<_, HasFilesystem>(ctx.linker(), get_view::<T>)?;
+
+        // This factor takes over `wasi:filesystem` from whatever linked it
+        // earlier - in practice the WASI factor, whose all-in-one linking is
+        // left untouched for embedders that do not use this factor. Shadowing
+        // is enabled just long enough to redefine those interfaces, then
+        // switched back off so accidental duplicates elsewhere still fail
+        // loudly. This requires the filesystem factor to be registered
+        // *after* the WASI factor; registering it before produces a duplicate
+        // definition error at startup rather than a silently wrong linker.
+        let linker = ctx.linker();
+        linker.allow_shadowing(true);
+        p2::types::add_to_linker::<_, HasFilesystem>(linker, get_view::<T>)?;
+        p2::preopens::add_to_linker::<_, HasFilesystem>(linker, get_view::<T>)?;
+        p2::compat::wasi_2023_10_18::types::add_to_linker::<_, HasFilesystem>(
+            linker,
+            get_view::<T>,
+        )?;
+        p2::compat::wasi_2023_10_18::preopens::add_to_linker::<_, HasFilesystem>(
+            linker,
+            get_view::<T>,
+        )?;
+        p2::compat::wasi_2023_11_10::types::add_to_linker::<_, HasFilesystem>(
+            linker,
+            get_view::<T>,
+        )?;
+        p2::compat::wasi_2023_11_10::preopens::add_to_linker::<_, HasFilesystem>(
+            linker,
+            get_view::<T>,
+        )?;
+        linker.allow_shadowing(false);
         Ok(())
     }
 

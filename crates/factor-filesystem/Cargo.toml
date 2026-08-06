@@ -25,6 +25,7 @@ wasmtime-wasi-io = { workspace = true }
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
+spin-factor-wasi = { path = "../factor-wasi" }
 spin-factors-test = { path = "../factors-test" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

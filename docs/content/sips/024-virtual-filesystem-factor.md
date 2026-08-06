@@ -194,9 +194,18 @@ an addition. Spin registers four `wasi:filesystem` families today:
 | `@0.2.0-rc-2023-10-18`, `@0.2.0-rc-2023-11-10` | `spin-factor-wasi::wasi_2023_*`, delegating to p2 |
 
 The first two move to the new factor. The last three are already thin shims that delegate to
-"whatever the current implementation is"; they are retargeted at the new factor's descriptor
-and keep working. `WasiFactor` gains a constructor that leaves filesystem linking to someone
-else, and keeps its current all-in-one behaviour for embedders that do not want the new factor.
+"whatever the current implementation is"; the new factor carries its own copies of those
+shims, retargeted at its descriptor, so snapshot-era guests keep working.
+
+The takeover itself is done by *shadowing* rather than by modifying `WasiFactor`: the
+filesystem factor's `init` enables `Linker::allow_shadowing` just long enough to redefine
+the `wasi:filesystem` interfaces over the WASI factor's definitions, then switches it back
+off. This keeps the change fully contained in the new factor - `spin-factor-wasi` is not
+modified at all, and keeps its all-in-one behaviour for embedders that do not register the
+filesystem factor. The one obligation this design places on embedders is ordering: the
+filesystem factor must be registered *after* the WASI factor. Registering it first fails at
+startup with a duplicate-definition error (shadowing is off while the WASI factor links),
+which is loud rather than subtle.
 
 To keep the blast radius honest, the `host` backend is an adaptation of `wasmtime-wasi`'s
 own `cap-std` logic rather than a fresh implementation. Both projects are Apache-2.0 WITH
