@@ -1,0 +1,6 @@
+[filesystem.data]
+type = "memory"
+
+[filesystem.frozen]
+type = "memory"
+writable = false

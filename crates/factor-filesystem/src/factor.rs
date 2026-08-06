@@ -15,7 +15,7 @@ use spin_locked_app::MetadataKey;
 use crate::backend::HostFilesystem;
 use crate::runtime_config::RuntimeConfig;
 use crate::spi::Filesystem;
-use crate::{FilesystemCtx, FilesystemCtxView, HasFilesystem, p2};
+use crate::{FilesystemCtx, FilesystemCtxView, HasFilesystem, p2, p3};
 
 /// Metadata key for a component's filesystem mounts.
 pub const FILESYSTEMS_KEY: MetadataKey<Vec<FilesystemMountMetadata>> =
@@ -105,6 +105,8 @@ impl Factor for FilesystemFactor {
             linker,
             get_view::<T>,
         )?;
+        p3::types::add_to_linker::<_, HasFilesystem>(linker, get_view::<T>)?;
+        p3::preopens::add_to_linker::<_, HasFilesystem>(linker, get_view::<T>)?;
         linker.allow_shadowing(false);
         Ok(())
     }

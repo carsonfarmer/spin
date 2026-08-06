@@ -10,8 +10,10 @@ pub mod backend;
 pub mod descriptor;
 mod factor;
 pub mod p2;
+pub mod p3;
 pub mod runtime_config;
 pub mod spi;
+mod task;
 
 use wasmtime::component::{HasData, ResourceTable};
 

@@ -86,6 +86,33 @@ mod integration_tests {
     }
 
     #[test]
+    /// Test that `filesystems` label mounts, defined as `[filesystem.<label>]`
+    /// runtime config, serve wasi:filesystem to components
+    fn filesystem_mounts_test() -> anyhow::Result<()> {
+        run_test(
+            "filesystem-mounts",
+            SpinConfig {
+                binary_path: spin_binary(),
+                spin_up_args: vec![
+                    "--runtime-config-file".into(),
+                    "runtime_config.toml".into(),
+                ],
+                app_type: SpinAppType::Http,
+            },
+            ServicesConfig::none(),
+            move |env| {
+                let spin = env.runtime_mut();
+                assert_spin_request(
+                    spin,
+                    Request::new(Method::Get, "/"),
+                    Response::new_with_body(200, "ok"),
+                )
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
     /// Test that basic http trigger support works
     fn http_smoke_test() -> anyhow::Result<()> {
         run_test(

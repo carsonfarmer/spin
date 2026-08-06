@@ -18,7 +18,7 @@ spin-locked-app = { path = "../locked-app" }
 tokio = { workspace = true, features = ["fs", "rt", "sync"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-wasmtime = { workspace = true }
+wasmtime = { workspace = true, features = ["component-model-bytes"] }
 wasmtime-wasi-io = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

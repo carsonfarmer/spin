@@ -16,11 +16,8 @@
 //! created here are ordinary `DynInputStream`/`DynOutputStream` resources
 //! that the existing `wasi:io/streams` implementation drives unmodified.
 
-use std::future::Future;
 use std::mem;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -36,6 +33,7 @@ use crate::spi::{
     Advice, DescriptorFlags, DescriptorType, ErrorCode, File, MetadataHash, NewTimestamp,
     OpenFlags, SetTimes, Stat,
 };
+use crate::task::Task;
 use crate::{FilesystemCtxView, p2};
 
 pub mod compat;
@@ -294,39 +292,6 @@ const STREAM_READ_CHUNK: usize = 64 * 1024;
 
 /// How much a file output stream reports as writable when idle.
 const STREAM_WRITE_CAPACITY: usize = 1024 * 1024;
-
-/// A spawned task whose handle aborts the task on drop, so a guest that
-/// drops a stream mid-operation cannot leak background work.
-struct Task<T>(tokio::task::JoinHandle<T>);
-
-impl<T: Send + 'static> Task<T> {
-    fn spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
-        Self(tokio::spawn(future))
-    }
-}
-
-impl<T> Drop for Task<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-impl<T> Future for Task<T> {
-    type Output = T;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        match Pin::new(&mut self.0).poll(cx) {
-            Poll::Ready(Ok(value)) => Poll::Ready(value),
-            Poll::Ready(Err(err)) => match err.try_into_panic() {
-                Ok(payload) => std::panic::resume_unwind(payload),
-                // We hold the only handle and only abort on drop, so the
-                // task cannot have been cancelled while being polled.
-                Err(err) => unreachable!("task cancelled while awaited: {err}"),
-            },
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
 
 /// A `wasi:io` input stream reading a [`File`] sequentially from a starting
 /// offset.
