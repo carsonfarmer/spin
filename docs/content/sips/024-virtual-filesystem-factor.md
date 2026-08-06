@@ -193,9 +193,11 @@ an addition. Spin registers four `wasi:filesystem` families today:
 | `wasi:filesystem@0.3.0-rc-2026-03-15` | `spin-factor-wasi::wasi_2026_03_15`, delegating to p3 |
 | `@0.2.0-rc-2023-10-18`, `@0.2.0-rc-2023-11-10` | `spin-factor-wasi::wasi_2023_*`, delegating to p2 |
 
-The first two move to the new factor. The last three are already thin shims that delegate to
-"whatever the current implementation is"; the new factor carries its own copies of those
-shims, retargeted at its descriptor, so snapshot-era guests keep working.
+The first two move to the new factor. The 2023 snapshots are thin shims that delegate to
+"whatever the current implementation is"; the new factor carries its own copies of them,
+retargeted at its descriptor, so snapshot-era guests keep working. The
+`0.3.0-rc-2026-03-15` shim still delegates to `wasmtime-wasi` (serving `files = [...]`
+mounts only, as before the factor existed); moving it over is follow-up work.
 
 The takeover itself is done by *shadowing* rather than by modifying `WasiFactor`: the
 filesystem factor's `init` enables `Linker::allow_shadowing` just long enough to redefine
