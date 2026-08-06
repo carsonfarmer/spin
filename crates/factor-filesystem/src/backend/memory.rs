@@ -44,7 +44,11 @@ impl MemoryFilesystem {
     /// Creates an empty filesystem containing only a root directory.
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
-        nodes.insert(ROOT, Node::new_dir());
+        let mut root = Node::new_dir();
+        // The root is never the target of `link`/`unlink`, so its count is
+        // fixed here: one name, forever.
+        root.links = 1;
+        nodes.insert(ROOT, root);
         Self {
             inner: Arc::new(RwLock::new(Tree {
                 nodes,
@@ -93,28 +97,27 @@ impl Filesystem for MemoryFilesystem {
     async fn open(&self, path: &FsPath, opts: OpenOptions) -> FsResult<Opened> {
         let mut tree = self.write();
 
-        let existing = match tree.resolve(path, opts.follow_symlinks) {
-            Ok(inode) => Some(inode),
-            Err(ErrorCode::NoEntry) if opts.open_flags.contains(OpenFlags::CREATE) => None,
-            Err(err) => return Err(err),
-        };
-
-        let inode = match existing {
-            Some(inode) => {
-                if opts.open_flags.contains(OpenFlags::EXCLUSIVE) {
-                    return Err(ErrorCode::Exist);
+        let creating = opts.open_flags.contains(OpenFlags::CREATE);
+        let inode = if creating {
+            // O_CREAT|O_EXCL does not follow a final symlink: a link there -
+            // even a dangling one - means "the path exists".
+            let exclusive = opts.open_flags.contains(OpenFlags::EXCLUSIVE);
+            let follow_final = !exclusive && opts.follow_symlinks;
+            let components: Vec<&str> = path.components().collect();
+            match tree.walk(&components, follow_final, true)? {
+                Lookup::Exists(_) if exclusive => return Err(ErrorCode::Exist),
+                Lookup::Exists(inode) => inode,
+                Lookup::Missing { dir, name } => {
+                    if opts.open_flags.contains(OpenFlags::DIRECTORY) {
+                        return Err(ErrorCode::NoEntry);
+                    }
+                    let inode = tree.alloc(Node::new_file(Vec::new()));
+                    tree.link(dir, &name, inode)?;
+                    inode
                 }
-                inode
             }
-            None => {
-                if opts.open_flags.contains(OpenFlags::DIRECTORY) {
-                    return Err(ErrorCode::NoEntry);
-                }
-                let (parent, name) = tree.resolve_parent(path)?;
-                let inode = tree.alloc(Node::new_file(Vec::new()));
-                tree.link(parent, &name, inode)?;
-                inode
-            }
+        } else {
+            tree.resolve(path, opts.follow_symlinks)?
         };
 
         let node = tree.node(inode)?;
@@ -227,10 +230,23 @@ impl Filesystem for MemoryFilesystem {
             .child(from_parent, &from_name)?
             .ok_or(ErrorCode::NoEntry)?;
 
+        // POSIX: if both names already refer to the same object, do nothing -
+        // and in particular do not remove either name.
+        if tree.child(to_parent, &to_name)? == Some(inode) {
+            return Ok(());
+        }
+
+        // Refuse to move a directory inside itself, which would orphan the
+        // subtree and, worse, make it unreachable but still linked. This
+        // must precede every mutation: a refused rename may not have
+        // side effects, least of all unlinking its destination.
+        if matches!(tree.node(inode)?.kind, NodeKind::Dir(_))
+            && tree.is_ancestor(inode, to_parent)?
+        {
+            return Err(ErrorCode::Invalid);
+        }
+
         if let Some(existing) = tree.child(to_parent, &to_name)? {
-            if existing == inode {
-                return Ok(());
-            }
             let source_is_dir = matches!(tree.node(inode)?.kind, NodeKind::Dir(_));
             match &tree.node(existing)?.kind {
                 NodeKind::Dir(entries) => {
@@ -247,20 +263,17 @@ impl Filesystem for MemoryFilesystem {
             tree.unlink(to_parent, &to_name)?;
         }
 
-        // Refuse to move a directory inside itself, which would orphan the
-        // subtree and, worse, make it unreachable but still linked.
-        if matches!(tree.node(inode)?.kind, NodeKind::Dir(_))
-            && tree.is_ancestor(inode, to_parent)?
-        {
-            return Err(ErrorCode::Invalid);
-        }
-
         tree.detach(from_parent, &from_name)?;
         tree.attach(to_parent, &to_name, inode)?;
         Ok(())
     }
 
     async fn symlink(&self, target: &str, link: &FsPath) -> FsResult<()> {
+        if target.starts_with('/') {
+            // WASI: "If `old-path` starts with `/`, the function fails with
+            // `error-code::not-permitted`."
+            return Err(ErrorCode::NotPermitted);
+        }
         let mut tree = self.write();
         let (parent, name) = tree.resolve_parent(link)?;
         if tree.child(parent, &name)?.is_some() {
@@ -429,6 +442,15 @@ struct Tree {
     next_inode: u64,
 }
 
+/// The result of a [`Tree::walk`].
+enum Lookup {
+    /// The path names this existing inode.
+    Exists(u64),
+    /// Everything up to the final component exists; the final component does
+    /// not. A create can land as `name` in the directory `dir`.
+    Missing { dir: u64, name: String },
+}
+
 impl Tree {
     fn node(&self, inode: u64) -> FsResult<&Node> {
         self.nodes.get(&inode).ok_or(ErrorCode::NoEntry)
@@ -530,7 +552,10 @@ impl Tree {
     /// if `follow_final` is set, at the final component too.
     fn resolve(&self, path: &FsPath, follow_final: bool) -> FsResult<u64> {
         let components: Vec<&str> = path.components().collect();
-        self.resolve_components(&components, follow_final)
+        match self.walk(&components, follow_final, false)? {
+            Lookup::Exists(inode) => Ok(inode),
+            Lookup::Missing { .. } => Err(ErrorCode::NoEntry),
+        }
     }
 
     /// Walks `components` from the root.
@@ -540,7 +565,13 @@ impl Tree {
     /// `a/link/..` land where POSIX says it should - in `link`'s target's
     /// parent - and what makes a `..` that would step above the root
     /// detectable rather than silently clamped.
-    fn resolve_components(&self, components: &[&str], follow_final: bool) -> FsResult<u64> {
+    ///
+    /// With `create` set, a missing *final* component is reported as
+    /// [`Lookup::Missing`] - the directory and name where a new object would
+    /// go - instead of as an error. Because symlink targets are spliced into
+    /// the walk, a dangling final symlink yields its *target's* location,
+    /// which is where POSIX says `O_CREAT` creates.
+    fn walk(&self, components: &[&str], follow_final: bool, create: bool) -> FsResult<Lookup> {
         let mut stack = vec![ROOT];
         // Remaining components, reversed so the next one is a `pop`.
         let mut queue: Vec<String> = components.iter().rev().map(|c| (*c).to_owned()).collect();
@@ -558,8 +589,16 @@ impl Tree {
                 continue;
             }
 
-            let child = self.child(current, &component)?.ok_or(ErrorCode::NoEntry)?;
             let is_final = queue.is_empty();
+            let Some(child) = self.child(current, &component)? else {
+                if is_final && create {
+                    return Ok(Lookup::Missing {
+                        dir: current,
+                        name: component,
+                    });
+                }
+                return Err(ErrorCode::NoEntry);
+            };
 
             if let NodeKind::Symlink(target) = &self.node(child)?.kind
                 && (!is_final || follow_final)
@@ -588,7 +627,9 @@ impl Tree {
             stack.push(child);
         }
 
-        Ok(*stack.last().expect("stack always holds at least the root"))
+        Ok(Lookup::Exists(
+            *stack.last().expect("stack always holds at least the root"),
+        ))
     }
 
     /// Splits `path` into its parent directory's inode and its final component.
@@ -601,7 +642,10 @@ impl Tree {
         if *name == ".." {
             return Err(ErrorCode::NotPermitted);
         }
-        let parent = self.resolve_components(parents, true)?;
+        let parent = match self.walk(parents, true, false)? {
+            Lookup::Exists(inode) => inode,
+            Lookup::Missing { .. } => return Err(ErrorCode::NoEntry),
+        };
         if !matches!(self.node(parent)?.kind, NodeKind::Dir(_)) {
             return Err(ErrorCode::NotDirectory);
         }
@@ -691,7 +735,9 @@ impl Node {
     fn stat(&self) -> Stat {
         Stat {
             type_: self.type_(),
-            link_count: self.links.max(1),
+            // Truthful even at zero: POSIX reports no links for a file that
+            // has been unlinked while a handle keeps it alive.
+            link_count: self.links,
             size: self.size(),
             data_access_timestamp: Some(self.atime),
             data_modification_timestamp: Some(self.mtime),

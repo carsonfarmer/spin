@@ -111,7 +111,8 @@ impl Filesystem for HostFilesystem {
             .truncate(opts.open_flags.contains(OpenFlags::TRUNCATE));
 
         let want_dir = opts.open_flags.contains(OpenFlags::DIRECTORY);
-        let want_write = opts.flags.contains(DescriptorFlags::WRITE);
+        let want_write = opts.flags.contains(DescriptorFlags::WRITE)
+            || opts.open_flags.contains(OpenFlags::TRUNCATE);
         let follow = opts.follow_symlinks;
 
         let opened = self
@@ -124,6 +125,16 @@ impl Filesystem for HostFilesystem {
                 } else {
                     dir.symlink_metadata(&path)
                 };
+
+                // POSIX: `O_NOFOLLOW` on a trailing symlink is `ELOOP`, and
+                // it wins over `O_DIRECTORY`'s `ENOTDIR` - matching Linux and
+                // wasmtime-wasi. (With `create`, `O_NOFOLLOW` still refuses
+                // the link rather than creating anything.) Reported as a
+                // typed error because `std` has no stable `ELOOP` spelling.
+                if !follow && meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Ok(Err(ErrorCode::Loop));
+                }
+
                 let is_dir = match &meta {
                     Ok(meta) => meta.is_dir(),
                     // The target may not exist yet, in which case `create`
@@ -142,7 +153,7 @@ impl Filesystem for HostFilesystem {
                     } else {
                         dir.open_dir_nofollow(&path)?;
                     }
-                    Ok(None)
+                    Ok(Ok(None))
                 } else {
                     if want_dir {
                         // Report a missing path as missing rather than as "not
@@ -150,10 +161,10 @@ impl Filesystem for HostFilesystem {
                         meta?;
                         return Err(io::Error::from(io::ErrorKind::NotADirectory));
                     }
-                    Ok(Some(dir.open_with(&path, &cap_opts)?))
+                    Ok(Ok(Some(dir.open_with(&path, &cap_opts)?)))
                 }
             })
-            .await?;
+            .await??;
 
         Ok(match opened {
             None => Opened::Dir,
