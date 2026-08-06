@@ -8,12 +8,18 @@
 
 pub mod backend;
 pub mod descriptor;
+mod factor;
 pub mod p2;
+pub mod runtime_config;
 pub mod spi;
 
 use wasmtime::component::{HasData, ResourceTable};
 
 pub use descriptor::{Descriptor, Preopens};
+pub use factor::{
+    AppState, FILESYSTEMS_KEY, FilesystemFactor, FilesystemMountMetadata, InstanceBuilder,
+};
+pub use runtime_config::{FilesystemDefinition, RuntimeConfig};
 pub use spi::{
     Advice, DescriptorFlags, DescriptorType, DirEntry, ErrorCode, File, Filesystem, FsPath,
     FsPathBuf, FsResult, MetadataHash, NewTimestamp, ObjectId, OpenFlags, OpenOptions, Opened,

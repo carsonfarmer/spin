@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use spin_common::ui::quoted_path;
+use spin_factor_filesystem::FilesystemFactor;
+use spin_factor_filesystem::runtime_config::spin as filesystem;
 use spin_factor_key_value::KeyValueFactor;
 use spin_factor_key_value::runtime_config::spin::{self as key_value};
 use spin_factor_llm::{LlmFactor, spin as llm};
@@ -38,6 +40,8 @@ pub struct ResolvedRuntimeConfig<T> {
     pub runtime_config: T,
     /// The resolver used to resolve key-value stores from runtime configuration.
     pub key_value_resolver: key_value::RuntimeConfigResolver,
+    /// The resolver used to resolve filesystems from runtime configuration.
+    pub filesystem_resolver: filesystem::RuntimeConfigResolver,
     /// The resolver used to resolve sqlite databases from runtime configuration.
     pub sqlite_resolver: sqlite::RuntimeConfigResolver,
     /// The fully resolved state directory.
@@ -71,6 +75,8 @@ impl<T> ResolvedRuntimeConfig<T> {
         let mut summaries = vec![];
         // [key_value_store.<label>: <type>]
         summaries.extend(summarize_labeled_typed_tables("key_value_store"));
+        // [filesystem.<label>: <type>]
+        summaries.extend(summarize_labeled_typed_tables("filesystem"));
         // [sqlite_database.<label>: <type>]
         summaries.extend(summarize_labeled_typed_tables("sqlite_database"));
         // [llm_compute: <type>]
@@ -175,7 +181,10 @@ where
         let outbound_networking = runtime_config_dir
             .clone()
             .map(OutboundNetworkingSpinRuntimeConfig::new);
-        let key_value_resolver = key_value_config_resolver(runtime_config_dir, state_dir.clone());
+        let key_value_resolver =
+            key_value_config_resolver(runtime_config_dir.clone(), state_dir.clone());
+        let filesystem_resolver =
+            filesystem::RuntimeConfigResolver::default_types(runtime_config_dir);
         let sqlite_resolver = sqlite_config_resolver(state_dir.clone())
             .context("failed to resolve sqlite runtime config")?;
 
@@ -186,6 +195,7 @@ where
         let source = TomlRuntimeConfigSource::new(
             toml_resolver,
             &key_value_resolver,
+            &filesystem_resolver,
             outbound_networking.as_ref(),
             &sqlite_resolver,
         );
@@ -198,6 +208,7 @@ where
         Ok(Self {
             runtime_config,
             key_value_resolver,
+            filesystem_resolver,
             sqlite_resolver,
             state_dir,
             log_dir,
@@ -338,6 +349,7 @@ impl<'a> TomlResolver<'a> {
 pub struct TomlRuntimeConfigSource<'a, 'b> {
     toml: TomlResolver<'b>,
     key_value: &'a key_value::RuntimeConfigResolver,
+    filesystem: &'a filesystem::RuntimeConfigResolver,
     outbound_networking: Option<&'a OutboundNetworkingSpinRuntimeConfig>,
     sqlite: &'a sqlite::RuntimeConfigResolver,
 }
@@ -346,12 +358,14 @@ impl<'a, 'b> TomlRuntimeConfigSource<'a, 'b> {
     pub fn new(
         toml_resolver: TomlResolver<'b>,
         key_value: &'a key_value::RuntimeConfigResolver,
+        filesystem: &'a filesystem::RuntimeConfigResolver,
         outbound_networking: Option<&'a OutboundNetworkingSpinRuntimeConfig>,
         sqlite: &'a sqlite::RuntimeConfigResolver,
     ) -> Self {
         Self {
             toml: toml_resolver,
             key_value,
+            filesystem,
             outbound_networking,
             sqlite,
         }
@@ -363,6 +377,14 @@ impl FactorRuntimeConfigSource<KeyValueFactor> for TomlRuntimeConfigSource<'_, '
         &mut self,
     ) -> anyhow::Result<Option<spin_factor_key_value::RuntimeConfig>> {
         Ok(Some(self.key_value.resolve(Some(&self.toml.table))?))
+    }
+}
+
+impl FactorRuntimeConfigSource<FilesystemFactor> for TomlRuntimeConfigSource<'_, '_> {
+    fn get_runtime_config(
+        &mut self,
+    ) -> anyhow::Result<Option<spin_factor_filesystem::RuntimeConfig>> {
+        Ok(Some(self.filesystem.resolve(Some(&self.toml.table))?))
     }
 }
 

@@ -6,7 +6,9 @@ use spin_serde::{DependencyName, DependencyPackageName, FixedVersion, LowerSnake
 pub use spin_serde::{KebabId, SnakeId};
 use std::path::PathBuf;
 
-pub use super::common::{ComponentBuildConfig, ComponentSource, Variable, WasiFilesMount};
+pub use super::common::{
+    ComponentBuildConfig, ComponentSource, FilesystemMount, Variable, WasiFilesMount,
+};
 use super::json_schema;
 
 pub(crate) type Map<K, V> = indexmap::IndexMap<K, V>;
@@ -605,6 +607,13 @@ pub struct Component {
     /// Learn more: https://spinframework.dev/writing-apps#including-files-with-components
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_files: Vec<String>,
+    /// Filesystems mounted into the component. Each entry mounts the
+    /// filesystem defined as `[filesystem.<label>]` in the runtime config at
+    /// the given absolute guest path.
+    ///
+    /// Example: `filesystems = [{ label = "repos", path = "/repos" }]`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystems: Vec<FilesystemMount>,
     /// Deprecated. Use `allowed_outbound_hosts` instead.
     ///
     /// Example: `allowed_http_hosts = ["example.com"]`
@@ -1136,6 +1145,7 @@ mod tests {
             environment: Map::new(),
             files: vec![],
             exclude_files: vec![],
+            filesystems: vec![],
             allowed_http_hosts: vec![],
             allowed_outbound_hosts: vec![],
             key_value_stores: labels.clone(),
