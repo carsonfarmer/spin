@@ -9213,6 +9213,7 @@ dependencies = [
  "rustix",
  "serde",
  "spin-common",
+ "spin-factor-filesystem",
  "spin-factor-wasi",
  "spin-factors",
  "spin-factors-test",

@@ -7,6 +7,8 @@
 #![deny(missing_docs)]
 
 pub mod backend;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod descriptor;
 mod factor;
 pub mod p2;
