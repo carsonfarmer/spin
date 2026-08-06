@@ -9202,6 +9202,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin-factor-filesystem"
+version = "4.1.0-pre0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "cap-fs-ext",
+ "cap-std 4.0.2",
+ "rustix",
+ "serde",
+ "spin-factors",
+ "spin-locked-app",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "spin-factor-key-value"
 version = "4.1.0-pre0"
 dependencies = [
