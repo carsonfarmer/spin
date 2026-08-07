@@ -66,10 +66,12 @@ Three pieces:
    artifact: it is what a third party implements, and it deliberately does not mention
    `wasmtime`, `bindgen`, or any WIT version.
 
-2. **Backends** — `host` (a real directory, via `cap-std`, semantically identical to what
-   Spin does today) and `memory` (a full in-memory tree with symlinks and hard links).
-   Object storage, overlays, and content-addressed stores are then out-of-tree exercises for
-   the reader, or follow-on crates.
+2. **Backends** — mirroring the key-value factor's shape, Spin registers a deliberately
+   small set: `host` (a real directory, via `cap-std`, semantically identical to what Spin
+   does today), with `s3` following in a companion crate. A `memory` backend (a full
+   in-memory tree with symlinks and hard links) exists as the factor's reference
+   implementation and test substrate; embedders may register it, but it is not a default
+   runtime-config type. Other backends are out-of-tree exercises for the reader.
 
 3. **The factor** — resolves mounts for each component, holds the descriptor table, and
    implements the `wasi:filesystem` host bindings over the SPI.
@@ -164,14 +166,10 @@ filesystems = [{ label = "repos", path = "/srv/git" }]
 ```toml
 # runtime-config.toml
 [filesystem.repos]
-type = "memory"
-maximum_size = 268435456  # optional; content budget in bytes, default 256 MiB
-
-# or
-[filesystem.repos]
 type = "host"
 path = "/var/lib/spin/repos"
 writable = true
+create = true   # optional: create the directory if absent
 ```
 
 `type` dispatches to a registered backend factory, mirroring `[key_value_store.<label>]` and

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use spin_factor_filesystem::backend::MemoryFilesystem;
-use spin_factor_filesystem::runtime_config::spin::RuntimeConfigResolver;
+use spin_factor_filesystem::runtime_config::spin::{MemoryFilesystemMaker, RuntimeConfigResolver};
 use spin_factor_filesystem::{
     DescriptorFlags, ErrorCode, FilesystemDefinition, FilesystemFactor, RuntimeConfig,
 };
@@ -179,7 +179,9 @@ async fn toml_definitions_resolve() -> anyhow::Result<()> {
         type = "memory"
         "#,
     )?;
-    let resolver = RuntimeConfigResolver::default_types(Some(tmp.path().to_owned()));
+    // `memory` is not a default type; embedders (and this test) opt in.
+    let mut resolver = RuntimeConfigResolver::default_types(Some(tmp.path().to_owned()));
+    resolver.register_filesystem_type(MemoryFilesystemMaker)?;
     let config = resolver.resolve(Some(&table))?;
 
     let host_data = config.get_filesystem("host-data").unwrap();

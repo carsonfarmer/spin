@@ -10,7 +10,7 @@
 //! writable = true
 //!
 //! [filesystem.scratch]
-//! type = "memory"
+//! type = "host"
 //! ```
 //!
 //! Embedders register additional types - an object store, an overlay -
@@ -81,13 +81,14 @@ impl RuntimeConfigResolver {
     ///
     /// Relative `path`s in `host` definitions resolve against `base_path`,
     /// conventionally the directory containing the runtime config file.
+    /// The filesystem types Spin registers by default: `host`. Backends
+    /// with their own crates (like `s3`) are registered where Spin composes
+    /// its runtime configuration; [`MemoryFilesystemMaker`] is available for
+    /// embedders and tests but is deliberately not a default type.
     pub fn default_types(base_path: Option<PathBuf>) -> Self {
         let mut resolver = Self::new();
         resolver
             .register_filesystem_type(HostFilesystemMaker::new(base_path))
-            .expect("no duplicate types in an empty resolver");
-        resolver
-            .register_filesystem_type(MemoryFilesystemMaker)
             .expect("no duplicate types in an empty resolver");
         resolver
     }
@@ -176,6 +177,10 @@ pub struct HostFilesystemRuntimeConfig {
     /// Whether mounts may mutate the directory. Defaults to read-only.
     #[serde(default)]
     pub writable: bool,
+    /// Whether to create the directory (and its parents) if absent.
+    /// Defaults to requiring it to exist.
+    #[serde(default)]
+    pub create: bool,
 }
 
 impl MakeFilesystem for HostFilesystemMaker {
@@ -190,6 +195,10 @@ impl MakeFilesystem for HostFilesystemMaker {
             Some(base) if runtime_config.path.is_relative() => base.join(&runtime_config.path),
             _ => runtime_config.path.clone(),
         };
+        if runtime_config.create {
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("failed to create host directory {}", path.display()))?;
+        }
         let filesystem = HostFilesystem::open(&path)
             .with_context(|| format!("failed to open host directory {}", path.display()))?;
         Ok(FilesystemDefinition {
@@ -199,8 +208,12 @@ impl MakeFilesystem for HostFilesystemMaker {
     }
 }
 
-/// The built-in `memory` filesystem type: an empty in-memory tree that
-/// lives as long as the application and is shared by all its instances.
+/// The `memory` filesystem type: an empty in-memory tree that lives as
+/// long as the application and is shared by all its instances.
+///
+/// Not registered by [`RuntimeConfigResolver::default_types`]: it is the
+/// factor's reference backend, used by its test suites and available to
+/// embedders via [`RuntimeConfigResolver::register_filesystem_type`].
 pub struct MemoryFilesystemMaker;
 
 /// Configuration for a `type = "memory"` filesystem.
