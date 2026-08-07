@@ -34,24 +34,19 @@ token = "…"    # for temporary (STS) credentials
 # For S3-compatible stores:
 # endpoint = "http://localhost:9000"
 # allow_http = true
-# S3 Express One Zone (directory buckets; see the isolation note below):
-# express = true
 ```
 
 Environment fallbacks: `SPIN_FS_S3_BUCKET`, `SPIN_FS_S3_PREFIX` (the
-platform-assigned root), `SPIN_FS_S3_ENDPOINT`, `SPIN_FS_S3_ALLOW_HTTP`,
-`SPIN_FS_S3_EXPRESS`. Explicit table values override the environment,
-except `prefix`, which composes: the environment root is identity, the
-table prefix is a relative path beneath it. Object paths have no `..`, so
-the composition cannot rise above the root — and the credential holds
-regardless.
+platform-assigned root), `SPIN_FS_S3_ENDPOINT`, `SPIN_FS_S3_ALLOW_HTTP`.
+Explicit table values override the environment, except `prefix`, which
+composes: the environment root is identity, the table prefix is a
+relative path beneath it. Object paths have no `..`, so the composition
+cannot rise above the root — and the credential holds regardless.
 
-`express` switches on S3 Express One Zone session authentication
-(directory buckets): single-digit-millisecond access, cheaper requests,
-single-AZ durability. The isolation trade matters here: directory buckets
-authorize at *bucket* granularity, so prefix-scoped credentials — the pool
-model's second wall — do not apply. Express fits per-tenant-bucket (silo)
-layouts or platform-internal mounts, not the shared-bucket tenant pool.
+(S3 Express One Zone is deliberately not supported: directory buckets
+authorize at bucket granularity, so prefix-scoped credentials — the pool
+model's isolation — cannot apply. Revisit if AWS adds prefix-scoped
+authorization there.)
 
 ## Credentials
 

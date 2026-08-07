@@ -29,9 +29,6 @@ pub mod env {
     pub const ENDPOINT: &str = "SPIN_FS_S3_ENDPOINT";
     /// Fallback for `allow_http` (`1`/`true`), for local development.
     pub const ALLOW_HTTP: &str = "SPIN_FS_S3_ALLOW_HTTP";
-    /// Fallback for `express` (`1`/`true`): S3 Express One Zone session
-    /// authentication (directory buckets).
-    pub const EXPRESS: &str = "SPIN_FS_S3_EXPRESS";
 }
 
 /// The `s3` filesystem type: a bucket (Amazon S3 or any S3-compatible
@@ -85,13 +82,6 @@ pub struct S3FilesystemRuntimeConfig {
     /// back to `SPIN_FS_S3_ALLOW_HTTP`.
     #[serde(default)]
     pub allow_http: Option<bool>,
-    /// Use S3 Express One Zone session authentication (directory
-    /// buckets). Falls back to `SPIN_FS_S3_EXPRESS`. Directory buckets
-    /// authorize at bucket granularity, so prefix-scoped credentials do
-    /// not apply; see the README before enabling in multi-tenant
-    /// deployments.
-    #[serde(default)]
-    pub express: Option<bool>,
     /// Whether mounts may mutate the bucket contents. Defaults to read-only.
     #[serde(default)]
     pub writable: bool,
@@ -110,7 +100,6 @@ struct Resolved {
     secret_key: Option<String>,
     token: Option<String>,
     allow_http: bool,
-    express: bool,
 }
 
 /// Applies environment fallbacks to `config`. `var` is the environment
@@ -147,7 +136,6 @@ fn resolve_config(
         secret_key: config.secret_key,
         token: config.token,
         allow_http: flag(config.allow_http, env::ALLOW_HTTP),
-        express: flag(config.express, env::EXPRESS),
     })
 }
 
@@ -261,9 +249,6 @@ async fn build_filesystem(config: Resolved) -> Result<ObjectStoreFilesystem, Err
     }
     if config.allow_http {
         builder = builder.with_allow_http(true);
-    }
-    if config.express {
-        builder = builder.with_s3_express(true);
     }
 
     let store = builder.build().map_err(|err| {
@@ -399,14 +384,13 @@ mod tests {
         let resolved = resolve_config(config(""), |name| match name {
             env::BUCKET => Some("platform-bucket".into()),
             env::PREFIX => Some("tenant-a".into()),
-            env::EXPRESS => Some("1".into()),
+            env::ALLOW_HTTP => Some("1".into()),
             _ => None,
         })
         .unwrap();
         assert_eq!(resolved.bucket, "platform-bucket");
         assert_eq!(resolved.prefix, "tenant-a");
-        assert!(resolved.express);
-        assert!(!resolved.allow_http);
+        assert!(resolved.allow_http);
     }
 
     #[test]
