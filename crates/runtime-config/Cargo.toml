@@ -15,7 +15,6 @@ spin-common = { path = "../common" }
 spin-expressions = { path = "../expressions" }
 spin-factor-filesystem = { path = "../factor-filesystem" }
 spin-filesystem-object-store = { path = "../filesystem-object-store" }
-spin-filesystem-sqlite = { path = "../filesystem-sqlite" }
 spin-factor-key-value = { path = "../factor-key-value" }
 spin-factor-llm = { path = "../factor-llm" }
 spin-factor-otel = { path = "../factor-otel" }

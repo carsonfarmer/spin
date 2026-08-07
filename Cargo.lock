@@ -9644,20 +9644,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin-filesystem-sqlite"
-version = "4.1.0-pre0"
-dependencies = [
- "anyhow",
- "async-trait",
- "rusqlite",
- "serde",
- "spin-factor-filesystem",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "spin-http"
 version = "4.1.0-pre0"
 dependencies = [
@@ -9950,7 +9936,6 @@ dependencies = [
  "spin-factors",
  "spin-factors-test",
  "spin-filesystem-object-store",
- "spin-filesystem-sqlite",
  "spin-key-value-aws",
  "spin-key-value-azure",
  "spin-key-value-redis",
