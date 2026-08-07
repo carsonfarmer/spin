@@ -183,8 +183,14 @@ where
             .map(OutboundNetworkingSpinRuntimeConfig::new);
         let key_value_resolver =
             key_value_config_resolver(runtime_config_dir.clone(), state_dir.clone());
-        let filesystem_resolver =
+        // The default `host` filesystem type plus the out-of-crate backend
+        // Spin ships: `s3`. Third-party embeddings register further types
+        // the same way.
+        let mut filesystem_resolver =
             filesystem::RuntimeConfigResolver::default_types(runtime_config_dir);
+        filesystem_resolver
+            .register_filesystem_type(spin_filesystem_object_store::S3FilesystemMaker)
+            .context("failed to register the s3 filesystem type")?;
         let sqlite_resolver = sqlite_config_resolver(state_dir.clone())
             .context("failed to resolve sqlite runtime config")?;
 

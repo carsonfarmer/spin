@@ -170,6 +170,18 @@ type = "host"
 path = "/var/lib/spin/repos"
 writable = true
 create = true   # optional: create the directory if absent
+
+# or an S3(-compatible) bucket prefix (core-tier semantics; see the
+# spin-filesystem-object-store crate for the multi-tenant isolation model)
+[filesystem.repos]
+type = "s3"
+bucket = "acme-spin-apps"
+prefix = "tenant-a/repos"
+region = "us-east-1"
+writable = true
+# credentials: access_key/secret_key/token in the table, or the standard
+# AWS configuration chain (with its own refresh), as in the aws_dynamo
+# key-value store
 ```
 
 `type` dispatches to a registered backend factory, mirroring `[key_value_store.<label>]` and
@@ -228,6 +240,20 @@ the working set has to fit on local disk.
 **A Spin-specific filesystem interface next to `wasi:filesystem`.** Defeats the entire
 purpose. The value here is that unmodified `gitoxide` runs on it.
 
+# Multi-tenant deployments
+
+The `s3` backend is the multi-tenant story: a mount's boundary is *(credentials, bucket,
+prefix)*, enforced twice — the runtime builds every key beneath the prefix and refuses `..`
+past the mount root, and per-tenant credentials scoped to the prefix make the store enforce
+the same line independently. Fleets do not need per-tenant IAM entities: one shared role
+plus an STS **inline session policy** per tenant vends prefix-scoped sessions from a single
+IAM object, minted by the orchestrator and injected per process. Credential *refresh* is
+deliberately not Spin's job: it lives in the AWS credential chain (the same one the
+`aws_dynamo` key-value store uses), so short-lived processes take static session
+credentials and long-lived ones point the chain at a refreshing source. The
+`spin-filesystem-object-store` README documents the pattern, the policy shape, and the TTL
+arithmetic.
+
 # Known behavioural differences
 
 Three places where this design knowingly reads differently from `wasmtime-wasi`'s
@@ -249,8 +275,11 @@ descriptor-per-dirfd model, all reviewed and accepted:
 
 # Future work
 
-- An object-storage backend (S3/R2/GCS) with the write-combining and prefix-listing that
-  makes packfile access tolerable over a network.
+- Write-combining and metadata caching for the object-store backend: today every write is
+  a whole-object PUT and every resolution step is verified against the store, which is
+  correct but chatty for deep trees. Packfile-heavy workloads want batching.
+- Extending the object-store backend's runtime-config types beyond `s3` (GCS and Azure are
+  the same `ObjectStore` trait, one maker each).
 - An overlay backend (read-only lower + writable upper) — with `host` and `memory` in place
   this is a small amount of code and makes copy-on-write app content trivial.
 - Per-mount quotas and operation limits, reusing `spin-connection-semaphore` the way the
