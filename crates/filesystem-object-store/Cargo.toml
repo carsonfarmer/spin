@@ -1,0 +1,29 @@
+[package]
+name = "spin-filesystem-object-store"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+object_store = { version = "0.12", features = ["aws"] }
+serde = { workspace = true }
+spin-factor-filesystem = { path = "../factor-filesystem" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+spin-factor-filesystem = { path = "../factor-filesystem", features = [
+  "conformance",
+] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true
