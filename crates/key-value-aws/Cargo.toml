@@ -21,5 +21,8 @@ spin-core = { path = "../core" }
 spin-factor-key-value = { path = "../factor-key-value" }
 tokio = { workspace = true, features = ["rt", "sync"] }
 
+[dev-dependencies]
+toml = { workspace = true }
+
 [lints]
 workspace = true

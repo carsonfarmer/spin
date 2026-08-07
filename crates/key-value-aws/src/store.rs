@@ -32,11 +32,57 @@ pub struct KeyValueAwsDynamo {
     consistent_read: bool,
     /// DynamoDB table, needs to be cloned when getting a store
     table: Arc<String>,
+    /// How guest keys map onto the table's key schema
+    layout: KeyLayout,
     /// DynamoDB client
     client: async_once_cell::Lazy<
         Client,
         std::pin::Pin<Box<dyn std::future::Future<Output = Client> + Send>>,
     >,
+}
+
+/// How guest keys map onto the DynamoDB table's key schema.
+///
+/// The layout is a property of the *table* - DynamoDB fixes the key schema at
+/// table creation - so it is selected by the runtime-config type rather than
+/// by a field: `aws_dynamo` tables use [`KeyLayout::Simple`], `aws_dynamo_shared`
+/// tables use [`KeyLayout::Namespaced`]. Pointing one layout at a table of
+/// the other shape fails loudly with DynamoDB's own validation error.
+#[derive(Clone, Debug)]
+pub enum KeyLayout {
+    /// The partition key (`PK`) is the guest key. The `aws_dynamo` layout.
+    Simple,
+    /// The partition key (`PK`) is a fixed namespace and the sort key (`SK`)
+    /// is the guest key. The `aws_dynamo_shared` layout.
+    ///
+    /// This is the multi-tenant shape: `get_keys` becomes a partition Query
+    /// rather than a table Scan, and an IAM `dynamodb:LeadingKeys` condition
+    /// can pin credentials to exactly this namespace - which matters because
+    /// in deployments where tenants author their own runtime config, the
+    /// namespace value is untrusted input and the scoped credential is the
+    /// isolation boundary.
+    Namespaced(Arc<String>),
+}
+
+impl KeyLayout {
+    /// The key-attribute map addressing `key` under this layout.
+    fn item_key(&self, key: String) -> HashMap<String, AttributeValue> {
+        match self {
+            KeyLayout::Simple => HashMap::from_iter([(PK.to_owned(), AttributeValue::S(key))]),
+            KeyLayout::Namespaced(namespace) => HashMap::from_iter([
+                (PK.to_owned(), AttributeValue::S(namespace.to_string())),
+                (SK.to_owned(), AttributeValue::S(key)),
+            ]),
+        }
+    }
+
+    /// The attribute that holds the guest key.
+    fn key_attribute(&self) -> &'static str {
+        match self {
+            KeyLayout::Simple => PK,
+            KeyLayout::Namespaced(_) => SK,
+        }
+    }
 }
 
 /// AWS Dynamo Key / Value runtime config literal options for authentication
@@ -94,6 +140,7 @@ impl KeyValueAwsDynamo {
         consistent_read: bool,
         table: String,
         auth_options: KeyValueAwsDynamoAuthOptions,
+        layout: KeyLayout,
     ) -> Result<Self> {
         let region_clone = region.clone();
         let client_fut = Box::pin(async move {
@@ -114,6 +161,7 @@ impl KeyValueAwsDynamo {
             region,
             consistent_read,
             table: Arc::new(table),
+            layout,
             client: async_once_cell::Lazy::from_future(client_fut),
         })
     }
@@ -126,6 +174,7 @@ impl StoreManager for KeyValueAwsDynamo {
             client: self.client.get_unpin().await.clone(),
             table: self.table.clone(),
             consistent_read: self.consistent_read,
+            layout: self.layout.clone(),
         }))
     }
 
@@ -134,10 +183,16 @@ impl StoreManager for KeyValueAwsDynamo {
     }
 
     fn summary(&self, _store_name: &str) -> Option<String> {
-        Some(format!(
-            "AWS DynamoDB region: {}, table: {}",
-            self.region, self.table
-        ))
+        Some(match &self.layout {
+            KeyLayout::Simple => format!(
+                "AWS DynamoDB region: {}, table: {}",
+                self.region, self.table
+            ),
+            KeyLayout::Namespaced(namespace) => format!(
+                "AWS DynamoDB region: {}, table: {}, namespace: {}",
+                self.region, self.table, namespace
+            ),
+        })
     }
 }
 
@@ -146,6 +201,7 @@ struct AwsDynamoStore {
     client: Client,
     table: Arc<String>,
     consistent_read: bool,
+    layout: KeyLayout,
 }
 
 #[derive(Debug, Clone)]
@@ -164,12 +220,17 @@ struct CompareAndSwap {
     key: String,
     client: Client,
     table: Arc<String>,
+    layout: KeyLayout,
     bucket_rep: u32,
     state: Mutex<CasState>,
 }
 
-/// Primary key in DynamoDB items used for querying items
+/// Primary key in DynamoDB items used for querying items. Holds the guest
+/// key in the simple layout and the namespace in the namespaced layout.
 const PK: &str = "PK";
+/// Sort key in DynamoDB items, holding the guest key in the namespaced
+/// layout. Absent from simple-layout tables.
+const SK: &str = "SK";
 /// Value key in DynamoDB items storing item value as binary
 const VAL: &str = "VAL";
 /// Version key in DynamoDB items used for atomic operations
@@ -183,10 +244,7 @@ impl Store for AwsDynamoStore {
             .get_item()
             .consistent_read(self.consistent_read)
             .table_name(self.table.as_str())
-            .key(
-                PK,
-                aws_sdk_dynamodb::types::AttributeValue::S(key.to_string()),
-            )
+            .set_key(Some(self.layout.item_key(key.to_string())))
             .projection_expression(VAL)
             .send()
             .await
@@ -216,11 +274,12 @@ impl Store for AwsDynamoStore {
     }
 
     async fn set(&self, key: &str, value: &[u8]) -> Result<(), Error> {
+        let mut item = self.layout.item_key(key.to_string());
+        item.insert(VAL.to_owned(), AttributeValue::B(Blob::new(value)));
         self.client
             .put_item()
             .table_name(self.table.as_str())
-            .item(PK, AttributeValue::S(key.to_string()))
-            .item(VAL, AttributeValue::B(Blob::new(value)))
+            .set_item(Some(item))
             .send()
             .await
             .map_err(log_error)?;
@@ -231,7 +290,7 @@ impl Store for AwsDynamoStore {
         self.client
             .delete_item()
             .table_name(self.table.as_str())
-            .key(PK, AttributeValue::S(key.to_string()))
+            .set_key(Some(self.layout.item_key(key.to_string())))
             .send()
             .await
             .map_err(log_error)?;
@@ -244,48 +303,77 @@ impl Store for AwsDynamoStore {
             .get_item()
             .consistent_read(self.consistent_read)
             .table_name(self.table.as_str())
-            .key(
-                PK,
-                aws_sdk_dynamodb::types::AttributeValue::S(key.to_string()),
-            )
-            .projection_expression(PK)
+            .set_key(Some(self.layout.item_key(key.to_string())))
+            .projection_expression(self.layout.key_attribute())
             .send()
             .await
             .map_err(log_error)?;
 
-        Ok(item.map(|item| item.contains_key(PK)).unwrap_or(false))
+        Ok(item
+            .map(|item| item.contains_key(self.layout.key_attribute()))
+            .unwrap_or(false))
     }
 
     async fn get_keys(&self, max_result_bytes: usize) -> Result<Vec<String>, Error> {
-        let mut primary_keys = Vec::new();
-
-        let mut scan_paginator = self
-            .client
-            .scan()
-            .table_name(self.table.as_str())
-            .projection_expression(PK)
-            .into_paginator()
-            .send();
-
+        let mut keys = Vec::new();
         let mut byte_count = std::mem::size_of::<Vec<String>>();
-        while let Some(output) = scan_paginator.next().await {
-            let scan_output = output.map_err(log_error)?;
-            if let Some(items) = scan_output.items {
-                for mut item in items {
-                    if let Some(AttributeValue::S(pk)) = item.remove(PK) {
-                        byte_count += std::mem::size_of::<String>() + pk.len();
-                        if byte_count > max_result_bytes {
-                            return Err(Error::Other(format!(
-                                "query result exceeds limit of {max_result_bytes} bytes"
-                            )));
+        let mut push = |key: String| {
+            byte_count += std::mem::size_of::<String>() + key.len();
+            if byte_count > max_result_bytes {
+                return Err(Error::Other(format!(
+                    "query result exceeds limit of {max_result_bytes} bytes"
+                )));
+            }
+            keys.push(key);
+            Ok(())
+        };
+
+        match &self.layout {
+            KeyLayout::Simple => {
+                let mut pages = self
+                    .client
+                    .scan()
+                    .table_name(self.table.as_str())
+                    .projection_expression(PK)
+                    .into_paginator()
+                    .send();
+                while let Some(output) = pages.next().await {
+                    for mut item in output.map_err(log_error)?.items.unwrap_or_default() {
+                        if let Some(AttributeValue::S(key)) = item.remove(PK) {
+                            push(key)?;
                         }
-                        primary_keys.push(pk);
+                    }
+                }
+            }
+            // A partition Query, not a table Scan: only this namespace's
+            // items are read, and an IAM `dynamodb:LeadingKeys` condition on
+            // the credentials covers listing like any other operation.
+            KeyLayout::Namespaced(namespace) => {
+                let mut pages = self
+                    .client
+                    .query()
+                    .table_name(self.table.as_str())
+                    .consistent_read(self.consistent_read)
+                    .key_condition_expression("#PK = :namespace")
+                    .expression_attribute_names("#PK", PK)
+                    .expression_attribute_values(
+                        ":namespace",
+                        AttributeValue::S(namespace.to_string()),
+                    )
+                    .projection_expression(SK)
+                    .into_paginator()
+                    .send();
+                while let Some(output) = pages.next().await {
+                    for mut item in output.map_err(log_error)?.items.unwrap_or_default() {
+                        if let Some(AttributeValue::S(key)) = item.remove(SK) {
+                            push(key)?;
+                        }
                     }
                 }
             }
         }
 
-        Ok(primary_keys)
+        Ok(keys)
     }
 
     async fn get_keys_async(
@@ -298,31 +386,68 @@ impl Store for AwsDynamoStore {
         let (keys_tx, keys_rx) = tokio::sync::mpsc::channel(4);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
-        let mut scan_paginator = self
-            .client
-            .scan()
-            .table_name(self.table.as_str())
-            .projection_expression(PK)
-            .into_paginator()
-            .send();
+        let layout = self.layout.clone();
+        let key_attribute = layout.key_attribute();
+        let mut scan_pages = None;
+        let mut query_pages = None;
+        match &layout {
+            KeyLayout::Simple => {
+                scan_pages = Some(
+                    self.client
+                        .scan()
+                        .table_name(self.table.as_str())
+                        .projection_expression(PK)
+                        .into_paginator()
+                        .send(),
+                );
+            }
+            KeyLayout::Namespaced(namespace) => {
+                query_pages = Some(
+                    self.client
+                        .query()
+                        .table_name(self.table.as_str())
+                        .consistent_read(self.consistent_read)
+                        .key_condition_expression("#PK = :namespace")
+                        .expression_attribute_names("#PK", PK)
+                        .expression_attribute_values(
+                            ":namespace",
+                            AttributeValue::S(namespace.to_string()),
+                        )
+                        .projection_expression(SK)
+                        .into_paginator()
+                        .send(),
+                );
+            }
+        }
 
         let the_work = async move {
-            while let Some(output) = scan_paginator.next().await {
-                let scan_output = output.map_err(log_error_v3)?;
-                if let Some(items) = scan_output.items {
-                    for mut item in items {
-                        if let Some(AttributeValue::S(pk)) = item.remove(PK) {
-                            if pk.len() > max_result_bytes {
-                                return Err(v3::Error::Other(format!(
-                                    "key exceeds limit of {max_result_bytes} bytes"
-                                )));
-                            }
-                            keys_tx.send(pk).await.map_err(log_error_v3)?;
+            let forward = |items: Vec<HashMap<String, AttributeValue>>| {
+                let mut out = Vec::new();
+                for mut item in items {
+                    if let Some(AttributeValue::S(key)) = item.remove(key_attribute) {
+                        if key.len() > max_result_bytes {
+                            return Err(v3::Error::Other(format!(
+                                "key exceeds limit of {max_result_bytes} bytes"
+                            )));
                         }
+                        out.push(key);
+                    }
+                }
+                Ok(out)
+            };
+            if let Some(mut pages) = scan_pages {
+                while let Some(output) = pages.next().await {
+                    for key in forward(output.map_err(log_error_v3)?.items.unwrap_or_default())? {
+                        keys_tx.send(key).await.map_err(log_error_v3)?;
+                    }
+                }
+            } else if let Some(mut pages) = query_pages {
+                while let Some(output) = pages.next().await {
+                    for key in forward(output.map_err(log_error_v3)?.items.unwrap_or_default())? {
+                        keys_tx.send(key).await.map_err(log_error_v3)?;
                     }
                 }
             }
-
             Ok(())
         };
         tokio::spawn(async move {
@@ -339,14 +464,13 @@ impl Store for AwsDynamoStore {
         max_result_bytes: usize,
     ) -> Result<Vec<(String, Option<Vec<u8>>)>, Error> {
         let mut results = Vec::with_capacity(keys.len());
+        let key_attribute = self.layout.key_attribute();
         let mut keys_and_attributes_builder = KeysAndAttributes::builder()
-            .projection_expression(format!("{PK},{VAL}"))
+            .projection_expression(format!("{key_attribute},{VAL}"))
             .consistent_read(self.consistent_read);
         for key in keys {
-            keys_and_attributes_builder = keys_and_attributes_builder.keys(HashMap::from_iter([(
-                PK.to_owned(),
-                AttributeValue::S(key),
-            )]))
+            keys_and_attributes_builder =
+                keys_and_attributes_builder.keys(self.layout.item_key(key))
         }
         let mut request_items = Some(HashMap::from_iter([(
             self.table.to_string(),
@@ -371,7 +495,7 @@ impl Store for AwsDynamoStore {
                 responses.and_then(|mut responses| responses.remove(self.table.as_str()))
             {
                 for mut item in items {
-                    match (item.remove(PK), item.remove(VAL)) {
+                    match (item.remove(key_attribute), item.remove(VAL)) {
                         (Some(AttributeValue::S(pk)), Some(AttributeValue::B(val))) => {
                             let val = val.into_inner();
                             byte_count += std::mem::size_of::<(String, Option<Vec<u8>>)>()
@@ -403,12 +527,13 @@ impl Store for AwsDynamoStore {
     async fn set_many(&self, key_values: Vec<(String, Vec<u8>)>) -> Result<(), Error> {
         let mut data = Vec::with_capacity(key_values.len());
         for (key, val) in key_values {
+            let mut item = self.layout.item_key(key);
+            item.insert(VAL.to_owned(), AttributeValue::B(Blob::new(val)));
             data.push(
                 WriteRequest::builder()
                     .put_request(
                         PutRequest::builder()
-                            .item(PK, AttributeValue::S(key))
-                            .item(VAL, AttributeValue::B(Blob::new(val)))
+                            .set_item(Some(item))
                             .build()
                             .map_err(log_error)?,
                     )
@@ -442,7 +567,7 @@ impl Store for AwsDynamoStore {
                 WriteRequest::builder()
                     .delete_request(
                         DeleteRequest::builder()
-                            .key(PK, AttributeValue::S(key))
+                            .set_key(Some(self.layout.item_key(key)))
                             .build()
                             .map_err(log_error)?,
                     )
@@ -475,7 +600,7 @@ impl Store for AwsDynamoStore {
             .get_item()
             .consistent_read(true)
             .table_name(self.table.as_str())
-            .key(PK, AttributeValue::S(key.clone()))
+            .set_key(Some(self.layout.item_key(key.clone())))
             .projection_expression(VAL)
             .send()
             .await
@@ -499,7 +624,7 @@ impl Store for AwsDynamoStore {
 
         let mut update = Update::builder()
             .table_name(self.table.as_str())
-            .key(PK, AttributeValue::S(key))
+            .set_key(Some(self.layout.item_key(key)))
             .update_expression("SET #VAL = :new_val")
             .expression_attribute_names("#VAL", VAL)
             .expression_attribute_values(
@@ -541,6 +666,7 @@ impl Store for AwsDynamoStore {
             key: key.to_string(),
             client: self.client.clone(),
             table: self.table.clone(),
+            layout: self.layout.clone(),
             state: Mutex::new(CasState::Unknown),
             bucket_rep,
         }))
@@ -555,7 +681,7 @@ impl Cas for CompareAndSwap {
             .get_item()
             .consistent_read(true)
             .table_name(self.table.as_str())
-            .key(PK, AttributeValue::S(self.key.clone()))
+            .set_key(Some(self.layout.item_key(self.key.clone())))
             .projection_expression(format!("{VAL},{VER}"))
             .send()
             .await
@@ -614,7 +740,7 @@ impl Cas for CompareAndSwap {
     async fn swap(&self, value: Vec<u8>) -> Result<(), SwapError> {
         let mut update = Update::builder()
             .table_name(self.table.as_str())
-            .key(PK, AttributeValue::S(self.key.clone()))
+            .set_key(Some(self.layout.item_key(self.key.clone())))
             .update_expression("SET #VAL = :val ADD #VER :increment")
             .expression_attribute_names("#VAL", VAL)
             .expression_attribute_names("#VER", VER)
@@ -663,5 +789,28 @@ impl Cas for CompareAndSwap {
 
     async fn key(&self) -> String {
         self.key.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_layout_addresses_by_partition_key() {
+        let key = KeyLayout::Simple.item_key("k1".into());
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[PK], AttributeValue::S("k1".into()));
+        assert_eq!(KeyLayout::Simple.key_attribute(), PK);
+    }
+
+    #[test]
+    fn namespaced_layout_addresses_by_partition_and_sort_key() {
+        let layout = KeyLayout::Namespaced(Arc::new("tenant-a".into()));
+        let key = layout.item_key("k1".into());
+        assert_eq!(key.len(), 2);
+        assert_eq!(key[PK], AttributeValue::S("tenant-a".into()));
+        assert_eq!(key[SK], AttributeValue::S("k1".into()));
+        assert_eq!(layout.key_attribute(), SK);
     }
 }

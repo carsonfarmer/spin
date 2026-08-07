@@ -9590,6 +9590,7 @@ dependencies = [
  "spin-core",
  "spin-factor-key-value",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
