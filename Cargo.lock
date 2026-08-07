@@ -9568,6 +9568,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin-filesystem-sqlite"
+version = "4.1.0-pre0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "rusqlite",
+ "serde",
+ "spin-factor-filesystem",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spin-http"
 version = "4.1.0-pre0"
 dependencies = [
