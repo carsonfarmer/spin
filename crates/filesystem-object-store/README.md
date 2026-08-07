@@ -4,6 +4,21 @@ An object-store-backed filesystem for Spin's filesystem factor, exposed in
 runtime config as `type = "s3"` — Amazon S3 or any S3-compatible endpoint
 (MinIO, Cloudflare R2, localstack, …).
 
+In a platform deployment the environment carries identity and the tenant's
+table carries only intent — the same model as `spin-key-value-s3`:
+
+```toml
+# The whole tenant-side config; SPIN_FS_S3_BUCKET, SPIN_FS_S3_PREFIX, and
+# scoped credentials are injected by the platform. `prefix` here is
+# *relative*, appended beneath the platform root.
+[filesystem.repos]
+type = "s3"
+prefix = "repos"
+writable = true
+```
+
+Self-hosted, the table can carry everything explicitly:
+
 ```toml
 # runtime-config.toml
 [filesystem.repos]
@@ -19,7 +34,24 @@ token = "…"    # for temporary (STS) credentials
 # For S3-compatible stores:
 # endpoint = "http://localhost:9000"
 # allow_http = true
+# S3 Express One Zone (directory buckets; see the isolation note below):
+# express = true
 ```
+
+Environment fallbacks: `SPIN_FS_S3_BUCKET`, `SPIN_FS_S3_PREFIX` (the
+platform-assigned root), `SPIN_FS_S3_ENDPOINT`, `SPIN_FS_S3_ALLOW_HTTP`,
+`SPIN_FS_S3_EXPRESS`. Explicit table values override the environment,
+except `prefix`, which composes: the environment root is identity, the
+table prefix is a relative path beneath it. Object paths have no `..`, so
+the composition cannot rise above the root — and the credential holds
+regardless.
+
+`express` switches on S3 Express One Zone session authentication
+(directory buckets): single-digit-millisecond access, cheaper requests,
+single-AZ durability. The isolation trade matters here: directory buckets
+authorize at *bucket* granularity, so prefix-scoped credentials — the pool
+model's second wall — do not apply. Express fits per-tenant-bucket (silo)
+layouts or platform-internal mounts, not the shared-bucket tenant pool.
 
 ## Credentials
 

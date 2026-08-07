@@ -16,6 +16,24 @@ use spin_factor_filesystem::{
 
 use crate::ObjectStoreFilesystem;
 
+/// The environment variables the platform injects; each is the fallback
+/// for the config field of the same name. Mirrors the `spin-key-value-s3`
+/// provider's model exactly.
+pub mod env {
+    /// Fallback for `bucket`.
+    pub const BUCKET: &str = "SPIN_FS_S3_BUCKET";
+    /// The mount root the platform assigns - conventionally the tenant
+    /// root. A table `prefix` is a *relative* path appended beneath it.
+    pub const PREFIX: &str = "SPIN_FS_S3_PREFIX";
+    /// Fallback for `endpoint`, for S3-compatible stores.
+    pub const ENDPOINT: &str = "SPIN_FS_S3_ENDPOINT";
+    /// Fallback for `allow_http` (`1`/`true`), for local development.
+    pub const ALLOW_HTTP: &str = "SPIN_FS_S3_ALLOW_HTTP";
+    /// Fallback for `express` (`1`/`true`): S3 Express One Zone session
+    /// authentication (directory buckets).
+    pub const EXPRESS: &str = "SPIN_FS_S3_EXPRESS";
+}
+
 /// The `s3` filesystem type: a bucket (Amazon S3 or any S3-compatible
 /// endpoint such as MinIO or R2) under a key prefix.
 pub struct S3FilesystemMaker;
@@ -30,22 +48,28 @@ pub struct S3FilesystemMaker;
 /// multi-tenant deployments, give each mount its own prefix and hand each
 /// tenant process credentials scoped to that prefix - an STS session policy
 /// on one shared role does this without per-tenant IAM entities.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3FilesystemRuntimeConfig {
-    /// The bucket holding the filesystem.
-    pub bucket: String,
+    /// The bucket holding the filesystem. Falls back to
+    /// `SPIN_FS_S3_BUCKET`.
+    #[serde(default)]
+    pub bucket: Option<String>,
     /// The bucket's region. Falls back to the region the AWS configuration
     /// chain resolves.
     #[serde(default)]
     pub region: Option<String>,
-    /// A custom endpoint URL, for S3-compatible stores. Falls back to the
-    /// chain's endpoint configuration (`AWS_ENDPOINT_URL`).
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// The key prefix the mount lives under. Defaults to the bucket root.
+    /// The key prefix the mount lives under. When the platform sets
+    /// `SPIN_FS_S3_PREFIX`, this is *relative*, appended beneath that
+    /// root - tenant config states intent, the environment carries
+    /// identity. Without the environment root it addresses from the
+    /// bucket root.
     #[serde(default)]
     pub prefix: String,
+    /// A custom endpoint URL, for S3-compatible stores. Falls back to
+    /// `SPIN_FS_S3_ENDPOINT`, then the chain (`AWS_ENDPOINT_URL`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// The access key for the bucket; paired with `secret_key`. When either
     /// half is absent the AWS configuration chain is used instead.
     #[serde(default)]
@@ -57,12 +81,74 @@ pub struct S3FilesystemRuntimeConfig {
     /// pairs, such as ones minted through an STS session policy.
     #[serde(default)]
     pub token: Option<String>,
-    /// Permit `http://` endpoints, for local development stores.
+    /// Permit `http://` endpoints, for local development stores. Falls
+    /// back to `SPIN_FS_S3_ALLOW_HTTP`.
     #[serde(default)]
-    pub allow_http: bool,
+    pub allow_http: Option<bool>,
+    /// Use S3 Express One Zone session authentication (directory
+    /// buckets). Falls back to `SPIN_FS_S3_EXPRESS`. Directory buckets
+    /// authorize at bucket granularity, so prefix-scoped credentials do
+    /// not apply; see the README before enabling in multi-tenant
+    /// deployments.
+    #[serde(default)]
+    pub express: Option<bool>,
     /// Whether mounts may mutate the bucket contents. Defaults to read-only.
     #[serde(default)]
     pub writable: bool,
+}
+
+/// The fully resolved configuration: every table field with its
+/// environment fallback applied, and the mount prefix composed from the
+/// platform root and the table's relative prefix.
+#[derive(Debug)]
+struct Resolved {
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    endpoint: Option<String>,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    token: Option<String>,
+    allow_http: bool,
+    express: bool,
+}
+
+/// Applies environment fallbacks to `config`. `var` is the environment
+/// lookup, injectable for tests.
+fn resolve_config(
+    config: S3FilesystemRuntimeConfig,
+    var: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Resolved> {
+    let flag = |value: Option<bool>, name: &str| {
+        value.unwrap_or_else(|| {
+            var(name).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    };
+    let Some(bucket) = config.bucket.or_else(|| var(env::BUCKET)) else {
+        anyhow::bail!(
+            "s3 filesystem requires a bucket, from the `bucket` field or {}",
+            env::BUCKET
+        );
+    };
+    // The platform's root is identity; the table's prefix is intent,
+    // relative beneath it. Object paths have no `..`, so the composition
+    // cannot rise above the root - and the credential holds regardless.
+    let prefix = match (var(env::PREFIX), config.prefix) {
+        (Some(root), rel) if !rel.is_empty() => format!("{root}/{rel}"),
+        (Some(root), _) => root,
+        (None, rel) => rel,
+    };
+    Ok(Resolved {
+        bucket,
+        prefix,
+        region: config.region,
+        endpoint: config.endpoint.or_else(|| var(env::ENDPOINT)),
+        access_key: config.access_key,
+        secret_key: config.secret_key,
+        token: config.token,
+        allow_http: flag(config.allow_http, env::ALLOW_HTTP),
+        express: flag(config.express, env::EXPRESS),
+    })
 }
 
 impl MakeFilesystem for S3FilesystemMaker {
@@ -74,8 +160,11 @@ impl MakeFilesystem for S3FilesystemMaker {
         runtime_config: Self::RuntimeConfig,
     ) -> anyhow::Result<FilesystemDefinition> {
         let writable = runtime_config.writable;
+        let resolved = resolve_config(runtime_config, |name| {
+            std::env::var(name).ok().filter(|v| !v.is_empty())
+        })?;
         Ok(FilesystemDefinition {
-            filesystem: Arc::new(S3Filesystem::new(runtime_config)),
+            filesystem: Arc::new(S3Filesystem::new(resolved)),
             writable,
         })
     }
@@ -102,7 +191,7 @@ type LazyFilesystem = async_once_cell::Lazy<
 >;
 
 impl S3Filesystem {
-    fn new(config: S3FilesystemRuntimeConfig) -> Self {
+    fn new(config: Resolved) -> Self {
         let summary = if config.prefix.is_empty() {
             format!("s3 {}", config.bucket)
         } else {
@@ -122,9 +211,7 @@ impl S3Filesystem {
     }
 }
 
-async fn build_filesystem(
-    config: S3FilesystemRuntimeConfig,
-) -> Result<ObjectStoreFilesystem, ErrorCode> {
+async fn build_filesystem(config: Resolved) -> Result<ObjectStoreFilesystem, ErrorCode> {
     let summary = if config.prefix.is_empty() {
         format!("s3 {}", config.bucket)
     } else {
@@ -174,6 +261,9 @@ async fn build_filesystem(
     }
     if config.allow_http {
         builder = builder.with_allow_http(true);
+    }
+    if config.express {
+        builder = builder.with_s3_express(true);
     }
 
     let store = builder.build().map_err(|err| {
@@ -286,16 +376,66 @@ mod tests {
 
     #[test]
     fn summary_includes_bucket_and_prefix() {
-        let fs = S3Filesystem::new(config(
-            r#"
-            bucket = "b"
-            prefix = "tenant-a/data"
-            "#,
-        ));
+        let resolved = resolve_config(
+            config(
+                r#"
+                bucket = "b"
+                prefix = "tenant-a/data"
+                "#,
+            ),
+            |_| None,
+        )
+        .unwrap();
+        let fs = S3Filesystem::new(resolved);
         assert_eq!(
             spin_factor_filesystem::Filesystem::summary(&fs),
             "s3 b/tenant-a/data"
         );
+    }
+
+    #[test]
+    fn environment_fills_what_the_table_leaves_out() {
+        // The platform-deployment shape: a tenant table can be empty.
+        let resolved = resolve_config(config(""), |name| match name {
+            env::BUCKET => Some("platform-bucket".into()),
+            env::PREFIX => Some("tenant-a".into()),
+            env::EXPRESS => Some("1".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(resolved.bucket, "platform-bucket");
+        assert_eq!(resolved.prefix, "tenant-a");
+        assert!(resolved.express);
+        assert!(!resolved.allow_http);
+    }
+
+    #[test]
+    fn table_prefix_is_relative_beneath_the_platform_root() {
+        let resolved = resolve_config(config(r#"prefix = "repos""#), |name| match name {
+            env::BUCKET => Some("platform-bucket".into()),
+            env::PREFIX => Some("tenant-a".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(resolved.prefix, "tenant-a/repos");
+
+        // Without a platform root, the table prefix addresses the bucket.
+        let resolved = resolve_config(
+            config(
+                r#"
+                bucket = "b"
+                prefix = "repos"
+                "#,
+            ),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(resolved.prefix, "repos");
+    }
+
+    #[test]
+    fn bucket_is_required_from_somewhere() {
+        assert!(resolve_config(config(""), |_| None).is_err());
     }
 
     #[test]
