@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use spin_common::arg_parser::parse_kv;
+use spin_factor_filesystem::FilesystemFactor;
 use spin_factor_key_value::KeyValueFactor;
 use spin_factor_llm::LlmFactor;
 use spin_factor_otel::OtelFactor;
@@ -28,6 +29,9 @@ use spin_variables_static::VariableSource;
 pub struct TriggerFactors {
     pub otel: OtelFactor,
     pub wasi: WasiFactor,
+    /// Takes over `wasi:filesystem` from the WASI factor by shadowing its
+    /// linker definitions, so it must come after `wasi` in this struct.
+    pub filesystem: FilesystemFactor,
     pub variables: VariablesFactor,
     pub key_value: KeyValueFactor,
     pub outbound_networking: OutboundNetworkingFactor,
@@ -48,9 +52,11 @@ impl TriggerFactors {
         experimental_wasi_otel: bool,
         spin_version: &str,
     ) -> anyhow::Result<Self> {
+        let working_dir = working_dir.into();
         Ok(Self {
             otel: OtelFactor::new(spin_version, experimental_wasi_otel)?,
-            wasi: wasi_factor(working_dir, allow_transient_writes),
+            wasi: wasi_factor(working_dir.clone(), allow_transient_writes),
+            filesystem: FilesystemFactor::new(working_dir, allow_transient_writes),
             variables: VariablesFactor::default(),
             key_value: KeyValueFactor::new(),
             outbound_networking: outbound_networking_factor(),

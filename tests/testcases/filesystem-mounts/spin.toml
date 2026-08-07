@@ -1,0 +1,14 @@
+spin_manifest_version = 2
+
+[application]
+name = "filesystem-mounts"
+authors = ["Spin Framework Contributors"]
+version = "0.1.0"
+
+[[trigger.http]]
+route = "/..."
+component = "test"
+
+[component.test]
+source = "%{source=filesystem-mounts}"
+filesystems = [{ label = "data", path = "/data" }, { label = "frozen", path = "/frozen" }]

@@ -227,6 +227,10 @@ impl LocalLoader {
             .string_array("key_value_stores", component.key_value_stores)
             .string_array("databases", component.sqlite_databases)
             .string_array("ai_models", component.ai_models)
+            .serializable(
+                "filesystems",
+                (!component.filesystems.is_empty()).then_some(&component.filesystems),
+            )?
             .serializable("build", component.build)?
             .take();
 

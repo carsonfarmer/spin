@@ -9202,6 +9202,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin-factor-filesystem"
+version = "4.1.0-pre0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "cap-fs-ext",
+ "cap-std 4.0.2",
+ "rustix",
+ "serde",
+ "spin-common",
+ "spin-factor-filesystem",
+ "spin-factor-wasi",
+ "spin-factors",
+ "spin-factors-test",
+ "spin-locked-app",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi-io",
+]
+
+[[package]]
 name = "spin-factor-key-value"
 version = "4.1.0-pre0"
 dependencies = [
@@ -9819,6 +9844,7 @@ dependencies = [
  "serde",
  "spin-common",
  "spin-expressions",
+ "spin-factor-filesystem",
  "spin-factor-key-value",
  "spin-factor-llm",
  "spin-factor-otel",
@@ -9856,6 +9882,7 @@ dependencies = [
  "anyhow",
  "clap",
  "spin-common",
+ "spin-factor-filesystem",
  "spin-factor-key-value",
  "spin-factor-llm",
  "spin-factor-otel",

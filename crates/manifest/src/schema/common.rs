@@ -157,6 +157,23 @@ pub enum WasiFilesMount {
     },
 }
 
+/// A filesystem mounted into a component.
+///
+/// The label names a filesystem defined as `[filesystem.<label>]` in the
+/// runtime config; the path is where the component sees it.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemMount {
+    /// The label of the filesystem, as defined in the runtime config.
+    ///
+    /// Example: `label = "repos"`
+    pub label: String,
+    /// The absolute guest path where the filesystem is mounted.
+    ///
+    /// Example: `path = "/repos"`
+    pub path: String,
+}
+
 /// Component build configuration
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

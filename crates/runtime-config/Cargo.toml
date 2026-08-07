@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 spin-common = { path = "../common" }
 spin-expressions = { path = "../expressions" }
+spin-factor-filesystem = { path = "../factor-filesystem" }
 spin-factor-key-value = { path = "../factor-key-value" }
 spin-factor-llm = { path = "../factor-llm" }
 spin-factor-otel = { path = "../factor-otel" }

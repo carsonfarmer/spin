@@ -1,0 +1,41 @@
+[package]
+name = "spin-factor-filesystem"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+cap-fs-ext = "4.0"
+cap-std = "4.0"
+serde = { workspace = true }
+spin-common = { path = "../common" }
+spin-factors = { path = "../factors" }
+spin-locked-app = { path = "../locked-app" }
+tokio = { workspace = true, features = ["fs", "rt", "sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true, features = ["component-model-bytes"] }
+wasmtime-wasi-io = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[features]
+# Exposes the `conformance` module: the behavioural test suite every
+# `Filesystem` backend must pass. Intended for `dev-dependencies` of backend
+# crates; the cases pull in nothing beyond this crate's normal dependencies.
+conformance = []
+
+[dev-dependencies]
+spin-factor-filesystem = { path = ".", features = ["conformance"] }
+spin-factor-wasi = { path = "../factor-wasi" }
+spin-factors-test = { path = "../factors-test" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

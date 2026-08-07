@@ -64,6 +64,7 @@ pub fn v1_to_v2_app(manifest: v1::AppManifestV1) -> Result<v2::AppManifest, Erro
                 environment: component.environment,
                 files: component.files,
                 exclude_files: component.exclude_files,
+                filesystems: Vec::new(),
                 key_value_stores: component.key_value_stores,
                 sqlite_databases: component.sqlite_databases,
                 ai_models: component.ai_models,

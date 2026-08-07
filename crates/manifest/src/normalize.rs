@@ -315,6 +315,7 @@ fn ensure_is_acceptable_dependency(
         environment,
         files,
         exclude_files: _,
+        filesystems,
         allowed_http_hosts,
         allowed_outbound_hosts,
         key_value_stores,
@@ -345,6 +346,9 @@ fn ensure_is_acceptable_dependency(
     }
     if !files.is_empty() {
         surprises.push("files");
+    }
+    if !filesystems.is_empty() {
+        surprises.push("filesystems");
     }
     if !key_value_stores.is_empty() {
         surprises.push("key_value_stores");

@@ -1,0 +1,12 @@
+# Two host-backed label mounts; `create` makes empty scratch directories, so
+# the guest starts from a clean tree.
+[filesystem.data]
+type = "host"
+path = "data-dir"
+create = true
+writable = true
+
+[filesystem.frozen]
+type = "host"
+path = "frozen-dir"
+create = true
