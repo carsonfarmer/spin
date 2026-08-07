@@ -9945,6 +9945,8 @@ dependencies = [
  "spin-factor-wasi",
  "spin-factors",
  "spin-factors-test",
+ "spin-filesystem-object-store",
+ "spin-filesystem-sqlite",
  "spin-key-value-aws",
  "spin-key-value-azure",
  "spin-key-value-redis",

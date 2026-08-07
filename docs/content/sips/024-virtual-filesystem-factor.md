@@ -170,6 +170,15 @@ type = "host"
 path = "/var/lib/spin/repos"
 writable = true
 create = true   # optional: create the directory if absent
+
+# or an S3(-compatible) bucket prefix (core-tier semantics; see the
+# spin-filesystem-object-store crate for the multi-tenant isolation model)
+[filesystem.repos]
+type = "s3"
+bucket = "acme-spin-apps"
+prefix = "tenant-a/repos"
+region = "us-east-1"
+writable = true
 ```
 
 `type` dispatches to a registered backend factory, mirroring `[key_value_store.<label>]` and
@@ -249,8 +258,11 @@ descriptor-per-dirfd model, all reviewed and accepted:
 
 # Future work
 
-- An object-storage backend (S3/R2/GCS) with the write-combining and prefix-listing that
-  makes packfile access tolerable over a network.
+- Write-combining and metadata caching for the object-store backend: today every write is
+  a whole-object PUT and every resolution step is verified against the store, which is
+  correct but chatty for deep trees. Packfile-heavy workloads want batching.
+- Extending the object-store backend's runtime-config types beyond `s3` (GCS and Azure are
+  the same `ObjectStore` trait, one maker each).
 - An overlay backend (read-only lower + writable upper) — with `host` and `memory` in place
   this is a small amount of code and makes copy-on-write app content trivial.
 - Per-mount quotas and operation limits, reusing `spin-connection-semaphore` the way the
