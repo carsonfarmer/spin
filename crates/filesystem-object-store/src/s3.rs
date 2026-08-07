@@ -2,10 +2,17 @@
 
 use std::sync::Arc;
 
-use object_store::aws::AmazonS3Builder;
+use async_trait::async_trait;
+use aws_config::{BehaviorVersion, Region};
+use aws_credential_types::provider::{ProvideCredentials as _, SharedCredentialsProvider};
+use object_store::aws::{AmazonS3Builder, AwsCredential};
+use object_store::{CredentialProvider, ObjectStore};
 use serde::{Deserialize, Serialize};
-use spin_factor_filesystem::FilesystemDefinition;
 use spin_factor_filesystem::runtime_config::spin::MakeFilesystem;
+use spin_factor_filesystem::{
+    DirEntry, ErrorCode, FilesystemDefinition, FsPath, FsResult, MetadataHash, ObjectId,
+    OpenOptions, Opened, SetTimes, Stat,
+};
 
 use crate::ObjectStoreFilesystem;
 
@@ -15,33 +22,41 @@ pub struct S3FilesystemMaker;
 
 /// Configuration for a `type = "s3"` filesystem.
 ///
-/// Credentials come from the table when given, and from the standard `AWS_*`
-/// environment variables otherwise. For multi-tenant deployments, give each
-/// mount its own prefix *and* credentials scoped to that prefix, so the
-/// service enforces the same boundary the runtime does.
-#[derive(Deserialize, Serialize)]
+/// Credential handling follows Spin's `aws_dynamo` key-value store: when
+/// `access_key` and `secret_key` are both present they are used directly,
+/// and otherwise credentials come from the standard AWS configuration chain
+/// (environment, shared config and SSO profiles, IMDS, container credential
+/// endpoints, web identity), with the SDK's own caching and refresh. For
+/// multi-tenant deployments, give each mount its own prefix and hand each
+/// tenant process credentials scoped to that prefix - an STS session policy
+/// on one shared role does this without per-tenant IAM entities.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3FilesystemRuntimeConfig {
     /// The bucket holding the filesystem.
     pub bucket: String,
-    /// The bucket's region. Falls back to `AWS_REGION`/`AWS_DEFAULT_REGION`.
+    /// The bucket's region. Falls back to the region the AWS configuration
+    /// chain resolves.
     #[serde(default)]
     pub region: Option<String>,
-    /// A custom endpoint URL, for S3-compatible stores.
+    /// A custom endpoint URL, for S3-compatible stores. Falls back to the
+    /// chain's endpoint configuration (`AWS_ENDPOINT_URL`).
     #[serde(default)]
     pub endpoint: Option<String>,
     /// The key prefix the mount lives under. Defaults to the bucket root.
     #[serde(default)]
     pub prefix: String,
-    /// Access key ID; paired with `secret_access_key`.
+    /// The access key for the bucket; paired with `secret_key`. When either
+    /// half is absent the AWS configuration chain is used instead.
     #[serde(default)]
-    pub access_key_id: Option<String>,
-    /// Secret access key; paired with `access_key_id`.
+    pub access_key: Option<String>,
+    /// The secret key for the bucket; paired with `access_key`.
     #[serde(default)]
-    pub secret_access_key: Option<String>,
-    /// Session token for temporary credentials.
+    pub secret_key: Option<String>,
+    /// The session token accompanying temporary `access_key`/`secret_key`
+    /// pairs, such as ones minted through an STS session policy.
     #[serde(default)]
-    pub session_token: Option<String>,
+    pub token: Option<String>,
     /// Permit `http://` endpoints, for local development stores.
     #[serde(default)]
     pub allow_http: bool,
@@ -58,40 +73,253 @@ impl MakeFilesystem for S3FilesystemMaker {
         &self,
         runtime_config: Self::RuntimeConfig,
     ) -> anyhow::Result<FilesystemDefinition> {
-        // `from_env` honours the standard AWS variables (credentials, region,
-        // profile-provided keys resolved by the environment); table values
-        // override them.
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&runtime_config.bucket);
-        if let Some(region) = &runtime_config.region {
-            builder = builder.with_region(region);
-        }
-        if let Some(endpoint) = &runtime_config.endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if let Some(access_key_id) = &runtime_config.access_key_id {
-            builder = builder.with_access_key_id(access_key_id);
-        }
-        if let Some(secret_access_key) = &runtime_config.secret_access_key {
-            builder = builder.with_secret_access_key(secret_access_key);
-        }
-        if let Some(session_token) = &runtime_config.session_token {
-            builder = builder.with_token(session_token);
-        }
-        if runtime_config.allow_http {
-            builder = builder.with_allow_http(true);
-        }
-        let store = builder.build()?;
-
-        let summary = if runtime_config.prefix.is_empty() {
-            format!("s3 {}", runtime_config.bucket)
-        } else {
-            format!("s3 {}/{}", runtime_config.bucket, runtime_config.prefix)
-        };
-        let filesystem =
-            ObjectStoreFilesystem::new(Arc::new(store), &runtime_config.prefix, summary)?;
+        let writable = runtime_config.writable;
         Ok(FilesystemDefinition {
-            filesystem: Arc::new(filesystem),
-            writable: runtime_config.writable,
+            filesystem: Arc::new(S3Filesystem::new(runtime_config)),
+            writable,
         })
+    }
+}
+
+/// An [`ObjectStoreFilesystem`] over a bucket, initialized on first use.
+///
+/// Construction has to stay synchronous (runtime config resolves before an
+/// async runtime is guaranteed), while the AWS configuration chain is
+/// async - the same tension `spin-key-value-aws` resolves the same way,
+/// with a lazily-awaited client.
+struct S3Filesystem {
+    summary: String,
+    inner: LazyFilesystem,
+}
+
+/// The one-shot initialization: awaited by the first operation, shared by
+/// all later ones.
+type LazyFilesystem = async_once_cell::Lazy<
+    Result<ObjectStoreFilesystem, ErrorCode>,
+    std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ObjectStoreFilesystem, ErrorCode>> + Send>,
+    >,
+>;
+
+impl S3Filesystem {
+    fn new(config: S3FilesystemRuntimeConfig) -> Self {
+        let summary = if config.prefix.is_empty() {
+            format!("s3 {}", config.bucket)
+        } else {
+            format!("s3 {}/{}", config.bucket, config.prefix)
+        };
+        Self {
+            summary,
+            inner: async_once_cell::Lazy::from_future(Box::pin(build_filesystem(config))),
+        }
+    }
+
+    async fn fs(&self) -> FsResult<&ObjectStoreFilesystem> {
+        match self.inner.get_unpin().await {
+            Ok(fs) => Ok(fs),
+            Err(code) => Err(*code),
+        }
+    }
+}
+
+async fn build_filesystem(
+    config: S3FilesystemRuntimeConfig,
+) -> Result<ObjectStoreFilesystem, ErrorCode> {
+    let summary = if config.prefix.is_empty() {
+        format!("s3 {}", config.bucket)
+    } else {
+        format!("s3 {}/{}", config.bucket, config.prefix)
+    };
+    let mut builder = AmazonS3Builder::new().with_bucket_name(&config.bucket);
+
+    let mut region = config.region.clone();
+    let mut endpoint = config.endpoint.clone();
+    match (&config.access_key, &config.secret_key) {
+        (Some(access_key), Some(secret_key)) => {
+            builder = builder
+                .with_access_key_id(access_key)
+                .with_secret_access_key(secret_key);
+            if let Some(token) = &config.token {
+                builder = builder.with_token(token);
+            }
+        }
+        _ => {
+            // No explicit pair: resolve through the standard AWS chain, and
+            // let its region/endpoint configuration fill any gaps the table
+            // leaves. The chain's provider caches and refreshes on its own,
+            // so expiring session credentials (IMDS, container endpoints,
+            // web identity) keep working in long-lived processes.
+            let mut loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(region) = region.clone() {
+                loader = loader.region(Region::new(region));
+            }
+            let sdk_config = loader.load().await;
+            region = region.or_else(|| sdk_config.region().map(|r| r.to_string()));
+            endpoint = endpoint.or_else(|| sdk_config.endpoint_url().map(str::to_string));
+            let Some(provider) = sdk_config.credentials_provider() else {
+                tracing::error!(
+                    "filesystem {summary}: no credentials in the AWS configuration chain"
+                );
+                return Err(ErrorCode::Access);
+            };
+            builder = builder.with_credentials(Arc::new(ChainCredentials { provider }));
+        }
+    }
+
+    if let Some(region) = region {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if config.allow_http {
+        builder = builder.with_allow_http(true);
+    }
+
+    let store = builder.build().map_err(|err| {
+        tracing::error!("filesystem {summary}: invalid s3 configuration: {err}");
+        ErrorCode::Io
+    })?;
+    ObjectStoreFilesystem::new(
+        Arc::new(store) as Arc<dyn ObjectStore>,
+        &config.prefix,
+        summary,
+    )
+    .map_err(|err| {
+        tracing::error!("invalid s3 filesystem prefix: {err}");
+        ErrorCode::Io
+    })
+}
+
+/// Bridges the AWS SDK's credential chain into `object_store`'s provider
+/// interface. Caching and refresh live in the chain, not here.
+#[derive(Debug)]
+struct ChainCredentials {
+    provider: SharedCredentialsProvider,
+}
+
+#[async_trait]
+impl CredentialProvider for ChainCredentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let credentials = self.provider.provide_credentials().await.map_err(|err| {
+            object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(err),
+            }
+        })?;
+        Ok(Arc::new(AwsCredential {
+            key_id: credentials.access_key_id().to_string(),
+            secret_key: credentials.secret_access_key().to_string(),
+            token: credentials.session_token().map(str::to_string),
+        }))
+    }
+}
+
+#[async_trait]
+impl spin_factor_filesystem::Filesystem for S3Filesystem {
+    fn summary(&self) -> String {
+        self.summary.clone()
+    }
+
+    async fn open(&self, path: &FsPath, opts: OpenOptions) -> FsResult<Opened> {
+        self.fs().await?.open(path, opts).await
+    }
+
+    async fn stat_at(&self, path: &FsPath, follow: bool) -> FsResult<Stat> {
+        self.fs().await?.stat_at(path, follow).await
+    }
+
+    async fn set_times_at(&self, path: &FsPath, follow: bool, times: SetTimes) -> FsResult<()> {
+        self.fs().await?.set_times_at(path, follow, times).await
+    }
+
+    async fn read_dir(&self, path: &FsPath) -> FsResult<Vec<DirEntry>> {
+        self.fs().await?.read_dir(path).await
+    }
+
+    async fn create_dir(&self, path: &FsPath) -> FsResult<()> {
+        self.fs().await?.create_dir(path).await
+    }
+
+    async fn remove_dir(&self, path: &FsPath) -> FsResult<()> {
+        self.fs().await?.remove_dir(path).await
+    }
+
+    async fn unlink(&self, path: &FsPath) -> FsResult<()> {
+        self.fs().await?.unlink(path).await
+    }
+
+    async fn rename(&self, from: &FsPath, to: &FsPath) -> FsResult<()> {
+        self.fs().await?.rename(from, to).await
+    }
+
+    async fn symlink(&self, target: &str, link: &FsPath) -> FsResult<()> {
+        self.fs().await?.symlink(target, link).await
+    }
+
+    async fn readlink(&self, path: &FsPath) -> FsResult<String> {
+        self.fs().await?.readlink(path).await
+    }
+
+    async fn hard_link(&self, from: &FsPath, follow: bool, to: &FsPath) -> FsResult<()> {
+        self.fs().await?.hard_link(from, follow, to).await
+    }
+
+    async fn metadata_hash_at(&self, path: &FsPath, follow: bool) -> FsResult<MetadataHash> {
+        self.fs().await?.metadata_hash_at(path, follow).await
+    }
+
+    async fn object_id_at(&self, path: &FsPath, follow: bool) -> FsResult<ObjectId> {
+        self.fs().await?.object_id_at(path, follow).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(toml: &str) -> S3FilesystemRuntimeConfig {
+        toml::from_str(toml).expect("valid config")
+    }
+
+    #[test]
+    fn summary_includes_bucket_and_prefix() {
+        let fs = S3Filesystem::new(config(
+            r#"
+            bucket = "b"
+            prefix = "tenant-a/data"
+            "#,
+        ));
+        assert_eq!(
+            spin_factor_filesystem::Filesystem::summary(&fs),
+            "s3 b/tenant-a/data"
+        );
+    }
+
+    #[test]
+    fn partial_static_credentials_fall_back_to_the_chain() {
+        // Mirrors the aws_dynamo key-value store: only a complete
+        // access_key/secret_key pair selects static credentials.
+        let cfg = config(
+            r#"
+            bucket = "b"
+            access_key = "half"
+            "#,
+        );
+        assert!(cfg.access_key.is_some() && cfg.secret_key.is_none());
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let err = toml::from_str::<S3FilesystemRuntimeConfig>(
+            r#"
+            bucket = "b"
+            access_key_id = "old-name"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("access_key_id"));
     }
 }

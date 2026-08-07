@@ -10,7 +10,16 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-once-cell = "0.5.4"
 async-trait = { workspace = true }
+# The same aws-config flags as spin-key-value-aws: no default HTTPS client,
+# credential sources beyond the basics enabled explicitly.
+aws-config = { version = "1.1.7", default-features = false, features = [
+  "rt-tokio",
+  "credentials-process",
+  "sso",
+] }
+aws-credential-types = "1.1.7"
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
@@ -24,6 +33,7 @@ spin-factor-filesystem = { path = "../factor-filesystem", features = [
   "conformance",
 ] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+toml = { workspace = true }
 
 [lints]
 workspace = true

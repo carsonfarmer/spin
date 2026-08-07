@@ -179,6 +179,9 @@ bucket = "acme-spin-apps"
 prefix = "tenant-a/repos"
 region = "us-east-1"
 writable = true
+# credentials: access_key/secret_key/token in the table, or the standard
+# AWS configuration chain (with its own refresh), as in the aws_dynamo
+# key-value store
 ```
 
 `type` dispatches to a registered backend factory, mirroring `[key_value_store.<label>]` and

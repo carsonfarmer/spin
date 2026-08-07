@@ -9628,7 +9628,10 @@ name = "spin-filesystem-object-store"
 version = "4.1.0-pre0"
 dependencies = [
  "anyhow",
+ "async-once-cell",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
  "bytes",
  "chrono",
  "futures",
@@ -9636,6 +9639,7 @@ dependencies = [
  "serde",
  "spin-factor-filesystem",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
