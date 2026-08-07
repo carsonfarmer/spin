@@ -92,17 +92,50 @@ enforce it, independently:
 }
 ```
 
-At fleet scale, per-tenant IAM entities are unnecessary: keep **one** IAM
-role with bucket-wide access and have the orchestrator mint each tenant's
+### One role, per-tenant sessions (the fleet pattern)
+
+At fleet scale, per-tenant IAM entities are unnecessary. Keep **one** IAM
+role with bucket-wide access, and have the orchestrator mint each tenant's
 credentials with `AssumeRole` plus an **inline session policy** restricting
-to that tenant's prefix — effective permissions are the intersection, the
-role is the only IAM object to manage, and the tenant process receives only
-its scoped session (the parent role must live outside tenant-exposed
-processes for the blast-radius benefit to hold). MinIO supports the same
-`AssumeRole`-with-policy flow; S3 Access Grants is the AWS-managed variant
-of the same broker. A deployment that shares one set of broad credentials
-across tenants leans on mechanism 1 alone; both walls together mean a
-defect in either still leaves the boundary standing.
+to that tenant's prefix. STS intersects the two, so the vended session can
+touch only the tenant's keys; the role is the only IAM object you ever
+manage, for any number of tenants.
+
+```sh
+aws sts assume-role \
+  --role-arn arn:aws:iam::123456789012:role/spin-tenant-fs \
+  --role-session-name tenant-a \
+  --duration-seconds 3600 \
+  --policy '{
+    "Version": "2012-10-17",
+    "Statement": [
+      { "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        "Resource": "arn:aws:s3:::acme-spin-apps/tenant-a/*" },
+      { "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": "arn:aws:s3:::acme-spin-apps",
+        "Condition": { "StringLike": { "s3:prefix": "tenant-a/*" } } }
+    ]
+  }'
+```
+
+The orchestrator injects the returned key/secret/token into the tenant's
+Spin process (`AWS_*` environment variables, or the `access_key` /
+`secret_key` / `token` table fields) and never hands the parent role to a
+tenant-exposed process — that placement is what turns a runtime compromise
+from a bucket-wide event into a one-prefix event.
+
+Process lifetime decides the rest, as described under *Credentials* above:
+short-lived processes just use the vended session as-is; long-lived ones
+point the credential chain at a refreshing source (the orchestrator can
+serve the container-credentials protocol) instead of static values.
+
+MinIO supports the same `AssumeRole`-with-policy flow, so the pattern works
+self-hosted; S3 Access Grants is the AWS-managed variant of the same
+broker. A deployment that shares one set of broad credentials across
+tenants leans on mechanism 1 alone; both walls together mean a defect in
+either still leaves the boundary standing.
 
 Tenants share nothing else: no cache, no connection-level state that could
 carry data across mounts.
