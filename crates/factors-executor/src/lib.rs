@@ -23,6 +23,8 @@ pub enum StoreCompletionOutcome<'a> {
 pub struct StoreCompletion<'a> {
     /// The component executed by the store.
     pub component_id: &'a str,
+    /// An opaque request ID supplied by the executor, if any.
+    pub request_id: Option<u64>,
     /// Fuel available before execution, if fuel is enabled.
     pub initial_fuel: Option<u64>,
     /// Fuel remaining after execution, if fuel is enabled.
@@ -36,6 +38,11 @@ pub struct StoreCompletion<'a> {
 }
 
 type StoreCompletionObserver = Box<dyn for<'a> Fn(StoreCompletion<'a>) + Send + Sync + 'static>;
+
+fn install_request_id(slot: &mut Option<u64>, request_id: u64) {
+    assert!(slot.is_none(), "request ID is already set");
+    *slot = Some(request_id);
+}
 
 /// A FactorsExecutor manages execution of a Spin app.
 ///
@@ -260,6 +267,7 @@ impl<T: RuntimeFactors, U: Send + 'static> FactorsExecutorApp<T, U> {
             instance_pre,
             app_component,
             factors: &self.executor.factors,
+            request_id: None,
             completion_observer: None,
         };
 
@@ -281,6 +289,7 @@ pub struct FactorsInstanceBuilder<'a, F: RuntimeFactors, U: 'static> {
     factor_builders: F::InstanceBuilders,
     instance_pre: &'a InstancePre<F, U>,
     factors: &'a F,
+    request_id: Option<u64>,
     completion_observer: Option<StoreCompletionObserver>,
 }
 
@@ -313,6 +322,15 @@ impl<T: RuntimeFactors, U: 'static> FactorsInstanceBuilder<'_, T, U> {
     /// Returns the compiled component for the instance.
     pub fn component(&self) -> &Component {
         self.instance_pre.component()
+    }
+
+    /// Associates an opaque request ID with this store's completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a request ID has already been associated with this store.
+    pub fn set_request_id(&mut self, request_id: u64) {
+        install_request_id(&mut self.request_id, request_id);
     }
 
     /// Observes completion synchronously; the observer must not block or panic.
@@ -356,6 +374,7 @@ impl<T: RuntimeFactors, U: Send> FactorsInstanceBuilder<'_, T, U> {
             cpu_time_last_entry: None,
             memory_used_on_init: 0,
             component_id: self.app_component.id().into(),
+            request_id: self.request_id,
             started_at: self.completion_observer.as_ref().map(|_| Instant::now()),
             initial_fuel: None,
             remaining_fuel: None,
@@ -432,6 +451,8 @@ pub struct InstanceState<T, U> {
     executor: U,
     /// The component ID.
     component_id: String,
+    /// The request ID associated with this store, if any.
+    request_id: Option<u64>,
 
     /// The last time guest code started running in this instance.
     cpu_time_last_entry: Option<Instant>,
@@ -488,6 +509,7 @@ impl<T, U> InstanceState<T, U> {
         }
         observer(StoreCompletion {
             component_id: &self.component_id,
+            request_id: self.request_id,
             initial_fuel: self.initial_fuel,
             remaining_fuel,
             guest_active: self.cpu_time_elapsed,
@@ -524,6 +546,15 @@ impl<T, U> InstanceState<T, U> {
     /// Provides mutable access to the ad-hoc executor instance state.
     pub fn executor_instance_state_mut(&mut self) -> &mut U {
         &mut self.executor
+    }
+
+    /// Associates an opaque request ID with this store's completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a request ID has already been associated with this store.
+    pub fn set_request_id(&mut self, request_id: u64) {
+        install_request_id(&mut self.request_id, request_id);
     }
 }
 
@@ -584,6 +615,7 @@ mod tests {
             .args(["foo"]);
 
         let observations = Arc::new(Mutex::new(Vec::new()));
+        instance_builder.set_request_id(41);
         instance_builder.on_store_completion(observer(observations.clone()));
 
         let (instance, mut store) = instance_builder.instantiate(()).await?;
@@ -599,6 +631,7 @@ mod tests {
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].component_id, "empty");
+        assert_eq!(observations[0].request_id, Some(41));
         assert_eq!(observations[0].outcome, ObservedOutcome::Returned);
         assert!(observations[0].remaining_fuel < Some(100));
         assert!(observations[0].guest_active > Duration::ZERO);
@@ -631,7 +664,30 @@ mod tests {
         assert_eq!(observations[2].outcome, ObservedOutcome::Dropped);
         assert!(observations.iter().all(|o| o.initial_fuel == Some(100)));
         assert!(observations.iter().all(|o| o.remaining_fuel == Some(80)));
+        assert!(observations.iter().all(|o| o.request_id.is_none()));
         Ok(())
+    }
+
+    #[test]
+    fn instance_state_request_id_reaches_completion() -> anyhow::Result<()> {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut store = test_store(observations.clone())?;
+        store.data_mut().set_request_id(42);
+        complete_store(&mut store, Ok(()));
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].request_id, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "request ID is already set")]
+    fn instance_state_rejects_a_second_request_id() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut store = test_store(observations).unwrap();
+        store.data_mut().set_request_id(42);
+        store.data_mut().set_request_id(43);
     }
 
     #[test]
@@ -657,6 +713,7 @@ mod tests {
 
     struct Observed {
         component_id: String,
+        request_id: Option<u64>,
         initial_fuel: Option<u64>,
         remaining_fuel: Option<u64>,
         guest_active: Duration,
@@ -672,6 +729,7 @@ mod tests {
             };
             observations.lock().unwrap().push(Observed {
                 component_id: completion.component_id.into(),
+                request_id: completion.request_id,
                 initial_fuel: completion.initial_fuel,
                 remaining_fuel: completion.remaining_fuel,
                 guest_active: completion.guest_active,
@@ -692,6 +750,7 @@ mod tests {
             factors: (),
             executor: (),
             component_id: "test".into(),
+            request_id: None,
             cpu_time_last_entry: None,
             cpu_time_elapsed: Duration::ZERO,
             memory_used_on_init: 0,

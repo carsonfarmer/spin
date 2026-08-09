@@ -26,7 +26,7 @@ use wasmtime_wasi_http::p3;
 
 use crate::HttpServer;
 use crate::headers::prepare_request_headers;
-use crate::server::set_request_deadline;
+use crate::server::{set_request_deadline, take_request_completion_id};
 
 pub(super) fn prepare_request(
     route_match: &RouteMatch<'_, '_>,
@@ -73,10 +73,14 @@ impl<S: HandlerState> WasiHttpExecutor<'_, S> {
     ) -> Result<Response<Body>> {
         prepare_request(route_match, &mut req, client_addr)?;
 
-        let (instance, mut store) = server
-            .trigger_instance_builder(component_id, req.uri().scheme())?
-            .instantiate(())
-            .await?;
+        let request_id = take_request_completion_id(&mut req);
+        let mut instance_builder =
+            server.trigger_instance_builder(component_id, req.uri().scheme())?;
+        if let Some(request_id) = request_id {
+            instance_builder.set_request_id(request_id);
+        }
+
+        let (instance, mut store) = instance_builder.instantiate(()).await?;
         set_request_deadline(&mut store, server.request_deadline());
 
         enum Handler {

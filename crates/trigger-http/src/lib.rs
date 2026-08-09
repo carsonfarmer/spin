@@ -40,6 +40,28 @@ pub use tls::TlsConfig;
 
 pub(crate) use wasmtime_wasi_http::p2::body::HyperIncomingBody as Body;
 
+/// An opaque ID copied from an HTTP request to its store-completion observation.
+///
+/// Insert this value into [`http::Request::extensions_mut`] before calling
+/// [`HttpServer::handle`]. WASIp2 requests have one store per request. WASIp3
+/// reports the ID only for single-use stores because a reused store has no
+/// exact request-level completion. A request that fails before creating a
+/// store produces no store-completion observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestCompletionId(u64);
+
+impl RequestCompletionId {
+    /// Creates a request-completion ID.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the opaque ID value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 const DEFAULT_WASIP3_MAX_INSTANCE_REUSE_COUNT: usize = 128;
 const DEFAULT_WASIP3_MAX_INSTANCE_CONCURRENT_REUSE_COUNT: usize = 16;
 const DEFAULT_REQUEST_TIMEOUT: Option<Range<Duration>> = None;

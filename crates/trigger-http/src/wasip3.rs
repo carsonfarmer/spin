@@ -27,11 +27,12 @@ impl<F: RuntimeFactors> Wasip3HttpExecutor<'_, F> {
     ) -> Result<http::Response<Body>> {
         self.0.state().init_once(server, req.uri());
         super::wasi::prepare_request(route_match, &mut req, client_addr)?;
+        let request_id = crate::server::take_request_completion_id(&mut req);
 
         Ok(self
             .0
             .handle(
-                (),
+                request_id,
                 req.map(|body| body.map_err(ErrorCode::from).boxed_unsync()),
             )
             .await?
