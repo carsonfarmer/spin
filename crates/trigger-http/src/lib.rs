@@ -17,7 +17,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -47,18 +50,33 @@ pub(crate) use wasmtime_wasi_http::p2::body::HyperIncomingBody as Body;
 /// reports the ID only for single-use stores because a reused store has no
 /// exact request-level completion. A request that fails before creating a
 /// store produces no store-completion observation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RequestCompletionId(u64);
+#[derive(Clone, Debug)]
+pub struct RequestCompletionId {
+    id: u64,
+    started: Arc<AtomicBool>,
+}
 
 impl RequestCompletionId {
     /// Creates a request-completion ID.
-    pub const fn new(id: u64) -> Self {
-        Self(id)
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            started: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Returns the opaque ID value.
-    pub const fn get(self) -> u64 {
-        self.0
+    pub fn get(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns whether this request reached a request-owned store.
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
     }
 }
 

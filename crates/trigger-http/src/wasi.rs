@@ -76,11 +76,14 @@ impl<S: HandlerState> WasiHttpExecutor<'_, S> {
         let request_id = take_request_completion_id(&mut req);
         let mut instance_builder =
             server.trigger_instance_builder(component_id, req.uri().scheme())?;
-        if let Some(request_id) = request_id {
-            instance_builder.set_request_id(request_id);
+        if let Some(request_id) = &request_id {
+            instance_builder.set_request_id(request_id.get());
         }
 
         let (instance, mut store) = instance_builder.instantiate(()).await?;
+        if let Some(request_id) = &request_id {
+            request_id.mark_started();
+        }
         set_request_deadline(&mut store, server.request_deadline());
 
         enum Handler {
