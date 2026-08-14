@@ -17,7 +17,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,6 +42,43 @@ pub use server::HttpServer;
 pub use tls::TlsConfig;
 
 pub(crate) use wasmtime_wasi_http::p2::body::HyperIncomingBody as Body;
+
+/// An opaque ID copied from an HTTP request to its store-completion observation.
+///
+/// Insert this value into [`http::Request::extensions_mut`] before calling
+/// [`HttpServer::handle`]. WASIp2 requests have one store per request. WASIp3
+/// reports the ID only for single-use stores because a reused store has no
+/// exact request-level completion. A request that fails before creating a
+/// store produces no store-completion observation.
+#[derive(Clone, Debug)]
+pub struct RequestCompletionId {
+    id: u64,
+    started: Arc<AtomicBool>,
+}
+
+impl RequestCompletionId {
+    /// Creates a request-completion ID.
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the opaque ID value.
+    pub fn get(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns whether this request reached a request-owned store.
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+}
 
 const DEFAULT_WASIP3_MAX_INSTANCE_REUSE_COUNT: usize = 128;
 const DEFAULT_WASIP3_MAX_INSTANCE_CONCURRENT_REUSE_COUNT: usize = 16;

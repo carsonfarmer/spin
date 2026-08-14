@@ -29,7 +29,7 @@ use spin_app::{APP_DESCRIPTION_KEY, APP_NAME_KEY};
 use spin_factor_outbound_http::intercept::OutboundHttpInterceptor as EmbedderOutboundHttpInterceptor;
 use spin_factor_outbound_http::{OutboundHttpFactor, SelfRequestOrigin};
 use spin_factors::RuntimeFactors;
-use spin_factors_executor::InstanceState;
+use spin_factors_executor::{InstanceState, complete_store};
 use spin_http::{
     app_info::AppInfo,
     body,
@@ -53,8 +53,8 @@ use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p3::bindings::Service;
 
 use crate::{
-    Body, InstanceReuseConfig, NotFoundRouteKind, OutputFormat, TlsConfig, TriggerApp,
-    TriggerInstanceBuilder,
+    Body, InstanceReuseConfig, NotFoundRouteKind, OutputFormat, RequestCompletionId, TlsConfig,
+    TriggerApp, TriggerInstanceBuilder,
     headers::strip_forbidden_headers,
     instrument::{MatchedRoute, finalize_http_span, http_span, instrument_error},
     outbound_http::OutboundHttpInterceptor,
@@ -65,6 +65,10 @@ use crate::{
 };
 
 pub const MAX_RETRIES: u16 = 10;
+
+pub(crate) fn take_request_completion_id<B>(req: &mut Request<B>) -> Option<RequestCompletionId> {
+    req.extensions_mut().remove::<RequestCompletionId>()
+}
 
 pub(crate) fn set_request_deadline<T>(
     store: &mut spin_core::Store<T>,
@@ -778,9 +782,23 @@ pub(crate) struct HttpWorkerState<F: RuntimeFactors> {
     _phantom: PhantomData<F>,
 }
 
+fn exact_store_request_id(
+    max_instance_reuse_count: usize,
+    request_id: Option<RequestCompletionId>,
+) -> Option<u64> {
+    if max_instance_reuse_count == 1 {
+        request_id.map(|request_id| {
+            request_id.mark_started();
+            request_id.get()
+        })
+    } else {
+        None
+    }
+}
+
 impl<F: RuntimeFactors> WorkerState for HttpWorkerState<F> {
     type StoreData = InstanceState<F::InstanceState, ()>;
-    type RequestId = ();
+    type RequestId = Option<RequestCompletionId>;
 
     fn should_accept_request(&self, concurrent_count: usize, total_count: usize) -> ShouldAccept {
         if total_count >= self.max_instance_reuse_count {
@@ -794,14 +812,19 @@ impl<F: RuntimeFactors> WorkerState for HttpWorkerState<F> {
 
     fn on_request_start(
         &self,
-        _: StoreContextMut<'_, Self::StoreData>,
-        _: Self::RequestId,
+        mut store: StoreContextMut<'_, Self::StoreData>,
+        request_id: Self::RequestId,
         _: GuestTaskId,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> {
+        if let Some(request_id) = exact_store_request_id(self.max_instance_reuse_count, request_id)
+        {
+            store.data_mut().set_request_id(request_id);
+        }
         Box::pin(tokio::time::sleep(self.request_timeout))
     }
 
-    fn drop(&self, store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+    fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+        complete_store(&mut store, result.as_ref().map(|_| ()));
         if let Err(error) = result {
             eprintln!("worker failed: {error:?}");
         }
@@ -882,5 +905,46 @@ impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
                 _phantom: PhantomData,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_completion_id_is_optional_and_consumed() {
+        let mut request = Request::new(());
+        assert!(take_request_completion_id(&mut request).is_none());
+
+        request
+            .extensions_mut()
+            .insert(RequestCompletionId::new(42));
+        assert_eq!(
+            take_request_completion_id(&mut request)
+                .as_ref()
+                .map(RequestCompletionId::get),
+            Some(42)
+        );
+        assert!(take_request_completion_id(&mut request).is_none());
+
+        request.extensions_mut().insert(RequestCompletionId::new(0));
+        assert_eq!(
+            take_request_completion_id(&mut request)
+                .as_ref()
+                .map(RequestCompletionId::get),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn p3_request_completion_id_requires_a_single_use_store() {
+        let single = RequestCompletionId::new(42);
+        assert_eq!(exact_store_request_id(1, Some(single.clone())), Some(42));
+        assert!(single.started());
+        assert_eq!(exact_store_request_id(1, None), None);
+        let reused = RequestCompletionId::new(42);
+        assert_eq!(exact_store_request_id(2, Some(reused.clone())), None);
+        assert!(!reused.started());
     }
 }

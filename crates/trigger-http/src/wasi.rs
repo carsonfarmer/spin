@@ -13,7 +13,7 @@ use spin_factor_outbound_http::wasi_2023_10_18::Proxy as Proxy2023_10_18;
 use spin_factor_outbound_http::wasi_2023_11_10::Proxy as Proxy2023_11_10;
 use spin_factor_outbound_http::wasi_2026_03_15::Service as Service2026_03_15;
 use spin_factors::{RuntimeFactors, RuntimeFactorsInstanceState};
-use spin_factors_executor::InstanceState;
+use spin_factors_executor::{InstanceState, complete_store};
 use spin_http::routes::RouteMatch;
 use spin_http::trigger::HandlerType;
 use tokio::{sync::oneshot, task};
@@ -26,7 +26,7 @@ use wasmtime_wasi_http::p3;
 
 use crate::HttpServer;
 use crate::headers::prepare_request_headers;
-use crate::server::set_request_deadline;
+use crate::server::{set_request_deadline, take_request_completion_id};
 
 pub(super) fn prepare_request(
     route_match: &RouteMatch<'_, '_>,
@@ -73,10 +73,17 @@ impl<S: HandlerState> WasiHttpExecutor<'_, S> {
     ) -> Result<Response<Body>> {
         prepare_request(route_match, &mut req, client_addr)?;
 
-        let (instance, mut store) = server
-            .trigger_instance_builder(component_id, req.uri().scheme())?
-            .instantiate(())
-            .await?;
+        let request_id = take_request_completion_id(&mut req);
+        let mut instance_builder =
+            server.trigger_instance_builder(component_id, req.uri().scheme())?;
+        if let Some(request_id) = &request_id {
+            instance_builder.set_request_id(request_id.get());
+        }
+
+        let (instance, mut store) = instance_builder.instantiate(()).await?;
+        if let Some(request_id) = &request_id {
+            request_id.mark_started();
+        }
         set_request_deadline(&mut store, server.request_deadline());
 
         enum Handler {
@@ -145,6 +152,7 @@ impl<S: HandlerState> WasiHttpExecutor<'_, S> {
                     store.data().core_state().memory_consumed()
                 );
 
+                complete_store(&mut store, result.as_ref().map(|_| ()));
                 result
             }
             .in_current_span(),
@@ -207,7 +215,7 @@ async fn handle_2026_03_15<T: RuntimeFactorsInstanceState, U: Send>(
     let (tx, rx) = oneshot::channel();
     task::spawn(
         async move {
-            store
+            let result = store
                 .as_context_mut()
                 .run_concurrent(async |accessor| {
                     let response = guest
@@ -228,7 +236,9 @@ async fn handle_2026_03_15<T: RuntimeFactorsInstanceState, U: Send>(
 
                     Ok(())
                 })
-                .await?
+                .await;
+            complete_store(&mut store, result.as_ref().map(|_| ()));
+            result?
         }
         .map_err(|e: anyhow::Error| {
             if std::io::stderr().is_terminal() {
