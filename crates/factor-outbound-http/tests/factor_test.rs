@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use bytes::Bytes;
 use http::{Request, Uri};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
@@ -12,9 +12,15 @@ use spin_factor_outbound_http::{
 };
 use spin_factor_outbound_networking::OutboundNetworkingFactor;
 use spin_factor_variables::VariablesFactor;
-use spin_factors::{RuntimeFactors, anyhow};
+use spin_factors::{App, RuntimeFactors, anyhow};
 use spin_factors_test::{TestEnvironment, toml};
-use spin_world::async_trait;
+use spin_world::{
+    async_trait,
+    v1::{
+        http as legacy_http,
+        http_types::{HttpError, Method, Request as LegacyRequest},
+    },
+};
 use tracing::{
     Subscriber,
     field::{Field, Visit},
@@ -28,6 +34,8 @@ use tracing_subscriber::{
 use wasmtime_wasi::p2::Pollable;
 use wasmtime_wasi_http::p2::types::OutgoingRequestConfig;
 use wasmtime_wasi_http::p3::{RequestOptions, bindings::http::types as p3_types};
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[derive(RuntimeFactors)]
 struct TestFactors {
@@ -141,6 +149,102 @@ async fn override_connect_addr_disallowed_private_ip_fails() -> anyhow::Result<(
         Err(ErrorCode::DestinationIpProhibited),
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_permit_is_held_while_response_body_is_buffered() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+    let (release_body, body_released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await?;
+        let _first_response = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            assert_ne!(first.read(&mut request).await?, 0);
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .await?;
+            let _ = headers_sent.send(());
+            let _ = body_released.await;
+            first.write_all(b"body").await?;
+            anyhow::Ok(())
+        });
+
+        let (mut second, _) = listener.accept().await?;
+        let mut request = [0; 1024];
+        assert_ne!(second.read(&mut request).await?, 0);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        anyhow::Ok(())
+    });
+
+    let factors = TestFactors {
+        variables: VariablesFactor::default(),
+        networking: OutboundNetworkingFactor::new(),
+        http: OutboundHttpFactor::default(),
+    };
+    let allowed_host = format!("http://{address}");
+    let env = TestEnvironment::new(factors)
+        .extend_manifest(toml! {
+            [component.test-component]
+            source = "does-not-exist.wasm"
+            allowed_outbound_hosts = [allowed_host]
+        })
+        .runtime_config(TestFactorsRuntimeConfig {
+            http: Some(spin_factor_outbound_http::runtime_config::RuntimeConfig {
+                max_concurrent_connections: Some(1),
+                wait_timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+    let locked_app = env.build_locked_app().await?;
+    let TestEnvironment {
+        factors,
+        runtime_config,
+        ..
+    } = env;
+    let configured_app = factors.configure_app(App::new("test-app", locked_app), runtime_config)?;
+    let component_id = configured_app
+        .app()
+        .components()
+        .last()
+        .context("no components")?
+        .id()
+        .to_owned();
+    let builders = factors.prepare(&configured_app, &component_id)?;
+    let mut first_state = factors.build_instance_state(builders)?;
+    let builders = factors.prepare(&configured_app, &component_id)?;
+    let mut second_state = factors.build_instance_state(builders)?;
+
+    let uri = format!("http://{address}/slow");
+    let first_request = legacy_request(uri.clone());
+    let first_response = tokio::spawn(async move {
+        legacy_http::Host::send_request(&mut first_state.http, first_request).await
+    });
+    headers_received.await?;
+
+    let second_response =
+        legacy_http::Host::send_request(&mut second_state.http, legacy_request(uri)).await;
+    assert!(matches!(second_response, Err(HttpError::TooManyRequests)));
+
+    let _ = release_body.send(());
+    let first_response = first_response.await??;
+    assert_eq!(first_response.body.as_deref(), Some(b"body".as_slice()));
+    server.abort();
+    Ok(())
+}
+
+fn legacy_request(uri: String) -> LegacyRequest {
+    LegacyRequest {
+        method: Method::Get,
+        uri,
+        headers: Vec::new(),
+        params: Vec::new(),
+        body: None,
+    }
 }
 
 async fn test_instance_state(
