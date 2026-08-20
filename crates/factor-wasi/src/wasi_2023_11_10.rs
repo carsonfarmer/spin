@@ -865,10 +865,6 @@ impl<T> wasi::sockets::tcp::HostTcpSocket for SpinSocketsView<'_, T> {
         network: Resource<Network>,
         remote_address: IpSocketAddress,
     ) -> wasmtime::Result<Result<(), SocketErrorCode>> {
-        // Delegate to the P2 SpinSocketsView impl (passing `self`, not `&mut self.inner`).
-        // This snapshot uses the raw P2 TcpSocket type — the resource rep is the same at
-        // start_connect and drop time — so the P2 impl's quota acquire/register/release
-        // logic round-trips correctly without any wrapper-level bookkeeping here.
         convert_result(
             latest::sockets::tcp::HostTcpSocket::start_connect(
                 self,
@@ -1132,6 +1128,8 @@ impl<T> wasi::sockets::tcp_create_socket::Host for SpinSocketsView<'_, T> {
         &mut self,
         address_family: IpAddressFamily,
     ) -> wasmtime::Result<Result<Resource<TcpSocket>, SocketErrorCode>> {
+        // This snapshot uses the raw P2 resource rep, so the latest create/drop
+        // hooks register and release the permit under the same key.
         convert_result(latest::sockets::tcp_create_socket::Host::create_tcp_socket(
             self,
             address_family.into(),

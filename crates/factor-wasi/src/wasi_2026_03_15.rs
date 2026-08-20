@@ -875,6 +875,8 @@ impl<T> wasi::sockets::types::HostTcpSocket for SpinSocketsView<'_, T> {
     ) -> wasmtime::Result<
         Result<Resource<wasi::sockets::types::TcpSocket>, wasi::sockets::types::ErrorCode>,
     > {
+        // This adapter preserves the latest P3 resource rep, so its create/drop
+        // hooks register and release the permit under the same key.
         convert_result(latest::sockets::types::HostTcpSocket::create(
             self,
             address_family.into(),
