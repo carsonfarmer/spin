@@ -76,6 +76,11 @@ impl OutboundAllowedHosts {
         Ok(is_allowed)
     }
 
+    /// Resolves and validates the configured allowed hosts.
+    pub async fn validate(&self) -> anyhow::Result<()> {
+        self.resolve().await.map(|_| ())
+    }
+
     async fn resolve(&self) -> anyhow::Result<Arc<AllowedHostsConfig>> {
         self.allowed_hosts_future
             .clone()
@@ -699,6 +704,8 @@ fn parse_service_chaining_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    use futures_util::FutureExt as _;
+
     impl AllowedHostConfig {
         fn new(scheme: SchemeConfig, host: HostConfig, port: PortConfig) -> Self {
             Self {
@@ -761,6 +768,20 @@ mod test {
 
     fn empty_values_resolver() -> impl SyncResolver {
         populated_resolver(&[("one", ""), ("two", "")])
+    }
+
+    #[test]
+    fn outbound_allowed_hosts_validation_awaits_shared_resolution() {
+        let error = Arc::new(anyhow::anyhow!("invalid allowed hosts"));
+        let future = futures_util::future::ready(Err(error)).boxed().shared();
+        let allowed_hosts = OutboundAllowedHosts::new(future, None);
+
+        let error = allowed_hosts
+            .validate()
+            .now_or_never()
+            .expect("ready shared resolution should complete")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid allowed hosts");
     }
 
     use ip_network::{IpNetwork, Ipv4Network, Ipv6Network};
