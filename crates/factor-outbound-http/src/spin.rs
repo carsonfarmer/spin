@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use futures::stream::TryStreamExt as _;
 use http_body_util::BodyExt;
@@ -97,6 +97,20 @@ impl spin_http::Host for crate::InstanceState {
         // Convert http::Request to reqwest::Request
         let req = reqwest::Request::try_from(req).map_err(|_| HttpError::InvalidUrl)?;
 
+        let has_blocked_networks = !self.hooks.blocked_networks.is_empty();
+        if has_blocked_networks
+            && let Some(host) = req.url().host_str()
+            && let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>()
+            && self.hooks.blocked_networks.is_blocked(&ip)
+        {
+            tracing::error!(
+                "error.type" = "destination_ip_prohibited",
+                ?ip,
+                "destination IP prohibited by runtime config"
+            );
+            return Err(HttpError::DestinationNotAllowed);
+        }
+
         // Allow reuse of Client's internal connection pool for multiple requests
         // in a single component execution
         let client = self.hooks.spin_http_client.get_or_insert_with(|| {
@@ -105,6 +119,11 @@ impl spin_http::Host for crate::InstanceState {
             )));
             if !self.hooks.connection_pooling_enabled {
                 builder = builder.pool_max_idle_per_host(0);
+            }
+            if has_blocked_networks {
+                builder = builder
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none());
             }
             builder.build().unwrap()
         });

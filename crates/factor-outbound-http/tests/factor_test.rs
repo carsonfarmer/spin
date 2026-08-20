@@ -349,6 +349,328 @@ async fn legacy_http_states(
     Ok((first_state, factors.build_instance_state(builders)?))
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_rejects_blocked_literal_ip_before_connecting() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (accepted, connection_accepted) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await?;
+        let _ = accepted.send(());
+        let mut request = [0; 1024];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        anyhow::Ok(())
+    });
+
+    let allowed_host = format!("http://{address}");
+    let mut state = test_instance_state(&allowed_host, false).await?;
+    let response = legacy_http::Host::send_request(
+        &mut state.http,
+        legacy_request(format!("http://{address}/blocked")),
+    )
+    .await;
+
+    assert!(matches!(response, Err(HttpError::DestinationNotAllowed)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), connection_accepted)
+            .await
+            .is_err(),
+        "blocked literal IP was contacted"
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_rejects_blocked_literal_ipv6() -> anyhow::Result<()> {
+    let allowed_host = "http://[::1]:9";
+    let uri = format!("{allowed_host}/blocked");
+    let mut state = test_instance_state(allowed_host, false).await?;
+
+    let response = legacy_http::Host::send_request(&mut state.http, legacy_request(uri)).await;
+
+    assert!(matches!(response, Err(HttpError::DestinationNotAllowed)));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_network_policy_disables_automatic_redirects() -> anyhow::Result<()> {
+    let target_listener = tokio::net::TcpListener::bind("[::1]:0").await?;
+    let target_address = target_listener.local_addr()?;
+    let (target_accepted, target_connection) = tokio::sync::oneshot::channel();
+    let target = tokio::spawn(async move {
+        let (mut connection, _) = target_listener.accept().await?;
+        let _ = target_accepted.send(());
+        let mut request = [0; 1024];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        anyhow::Ok(())
+    });
+
+    let initial_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let initial_address = initial_listener.local_addr()?;
+    let initial = tokio::spawn(async move {
+        let (mut connection, _) = initial_listener.accept().await?;
+        let mut request = [0; 1024];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        anyhow::Ok(())
+    });
+
+    let allowed_host = format!("http://{initial_address}");
+    let factors = TestFactors {
+        variables: VariablesFactor::default(),
+        networking: OutboundNetworkingFactor::new(),
+        http: OutboundHttpFactor::default(),
+    };
+    let env = TestEnvironment::new(factors)
+        .extend_manifest(toml! {
+            [component.test-component]
+            source = "does-not-exist.wasm"
+            allowed_outbound_hosts = [allowed_host]
+        })
+        .runtime_config(TestFactorsRuntimeConfig {
+            networking: Some(
+                spin_factor_outbound_networking::runtime_config::RuntimeConfig {
+                    blocked_ip_networks: vec![
+                        spin_factor_outbound_networking::config::blocked_networks::test::cidr(
+                            "::1/128",
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        })?;
+    let mut state = env.build_instance_state().await?;
+    let response = legacy_http::Host::send_request(
+        &mut state.http,
+        legacy_request(format!("http://{initial_address}/redirect")),
+    )
+    .await?;
+
+    assert_eq!(response.status, 302);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), target_connection)
+            .await
+            .is_err(),
+        "redirect contacted a blocked literal IP"
+    );
+    initial.await??;
+    target.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_blocked_network_policy_preserves_automatic_redirects() -> anyhow::Result<()> {
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let target_address = target_listener.local_addr()?;
+    let target = tokio::spawn(async move {
+        let (mut connection, _) = target_listener.accept().await?;
+        let mut request = [0; 1024];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        anyhow::Ok(())
+    });
+    let initial_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let initial_address = initial_listener.local_addr()?;
+    let initial = tokio::spawn(async move {
+        let (mut connection, _) = initial_listener.accept().await?;
+        let mut request = [0; 1024];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        anyhow::Ok(())
+    });
+    let allowed_host = format!("http://{initial_address}");
+    let mut state = test_instance_state(&allowed_host, true).await?;
+
+    let response = legacy_http::Host::send_request(
+        &mut state.http,
+        legacy_request(format!("http://{initial_address}/redirect")),
+    )
+    .await?;
+
+    assert_eq!(response.body.as_deref(), Some(b"ok".as_slice()));
+    initial.await??;
+    target.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_ignores_environment_proxy_with_blocked_network_policy() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_url = format!("http://{}", listener.local_addr()?);
+    let (accepted, proxy_accepted) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await?;
+        let _ = accepted.send(());
+        let mut request = [0; 2048];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy")
+            .await?;
+        anyhow::Ok(())
+    });
+
+    let output = run_proxy_child(proxy_url, false).await?;
+
+    assert!(
+        output.status.success(),
+        "proxy child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), proxy_accepted)
+            .await
+            .is_err(),
+        "environment proxy was contacted"
+    );
+    proxy.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_preserves_environment_proxy_without_blocked_policy() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_url = format!("http://{}", listener.local_addr()?);
+    let (accepted, proxy_accepted) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await?;
+        let _ = accepted.send(());
+        let mut request = [0; 2048];
+        assert_ne!(connection.read(&mut request).await?, 0);
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy")
+            .await?;
+        anyhow::Ok(())
+    });
+
+    let output = run_proxy_child(proxy_url, true).await?;
+
+    assert!(
+        output.status.success(),
+        "proxy child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tokio::time::timeout(Duration::from_secs(1), proxy_accepted).await??;
+    proxy.await??;
+    Ok(())
+}
+
+async fn run_proxy_child(
+    proxy_url: String,
+    expect_proxy: bool,
+) -> anyhow::Result<std::process::Output> {
+    let test_binary = std::env::current_exe()?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(test_binary);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "legacy_http_environment_proxy_child",
+                "--nocapture",
+            ])
+            .env("SPIN_TEST_HTTP_PROXY", &proxy_url);
+        if expect_proxy {
+            command.env("SPIN_TEST_EXPECT_PROXY", "1");
+        }
+        for variable in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(variable, &proxy_url);
+        }
+        command.env("NO_PROXY", "").env("no_proxy", "").output()
+    })
+    .await??)
+}
+
+#[ignore = "run in an isolated child process by the proxy regression"]
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_http_environment_proxy_child() -> anyhow::Result<()> {
+    if std::env::var_os("SPIN_TEST_HTTP_PROXY").is_none() {
+        return Ok(());
+    }
+
+    let expect_proxy = std::env::var_os("SPIN_TEST_EXPECT_PROXY").is_some();
+    let factors = TestFactors {
+        variables: VariablesFactor::default(),
+        networking: OutboundNetworkingFactor::new(),
+        http: OutboundHttpFactor::default(),
+    };
+    let target = "http://203.0.113.1:9";
+    let networking =
+        (!expect_proxy).then(
+            || spin_factor_outbound_networking::runtime_config::RuntimeConfig {
+                blocked_ip_networks: vec![
+                    spin_factor_outbound_networking::config::blocked_networks::test::cidr(
+                        "1.1.1.1/32",
+                    ),
+                ],
+                ..Default::default()
+            },
+        );
+    let env = TestEnvironment::new(factors)
+        .extend_manifest(toml! {
+            [component.test-component]
+            source = "does-not-exist.wasm"
+            allowed_outbound_hosts = [target]
+        })
+        .runtime_config(TestFactorsRuntimeConfig {
+            networking,
+            ..Default::default()
+        })?;
+    let mut state = env.build_instance_state().await?;
+    let response = tokio::time::timeout(
+        Duration::from_millis(500),
+        legacy_http::Host::send_request(
+            &mut state.http,
+            legacy_request(format!("{target}/must-not-use-proxy")),
+        ),
+    )
+    .await;
+
+    if expect_proxy {
+        let response = response
+            .context("proxy request timed out")?
+            .map_err(|error| {
+                anyhow::anyhow!("request through environment proxy failed: {error:?}")
+            })?;
+        assert_eq!(response.body.as_deref(), Some(b"proxy".as_slice()));
+    } else {
+        assert!(
+            !matches!(response, Ok(Ok(_))),
+            "request unexpectedly succeeded through the environment proxy"
+        );
+    }
+    Ok(())
+}
+
 fn legacy_request(uri: String) -> LegacyRequest {
     LegacyRequest {
         method: Method::Get,
