@@ -97,6 +97,16 @@ pub struct StaticResponse {
 }
 
 impl StaticResponse {
+    /// Validates that this response can be converted to an HTTP response.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        http::StatusCode::from_u16(self.status())?;
+        for (name, value) in &self.headers {
+            http::HeaderName::try_from(name)?;
+            http::HeaderValue::try_from(value)?;
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> u16 {
         self.status_code.unwrap_or(200)
     }
@@ -122,5 +132,29 @@ mod tests {
         };
         assert_eq!(config.entrypoint, "_start");
         assert_eq!(config.argv, "${SCRIPT_NAME} ${ARGS}");
+    }
+
+    #[test]
+    fn static_response_validation_rejects_malformed_http_parts() {
+        let invalid_status: StaticResponse = toml::toml! {
+            status_code = 99
+        }
+        .try_into()
+        .unwrap();
+        assert!(invalid_status.validate().is_err());
+
+        let invalid_header_name: StaticResponse = toml::toml! {
+            headers = { "bad header" = "value" }
+        }
+        .try_into()
+        .unwrap();
+        assert!(invalid_header_name.validate().is_err());
+
+        let invalid_header_value: StaticResponse = toml::toml! {
+            headers = { valid = "bad\nvalue" }
+        }
+        .try_into()
+        .unwrap();
+        assert!(invalid_header_value.validate().is_err());
     }
 }

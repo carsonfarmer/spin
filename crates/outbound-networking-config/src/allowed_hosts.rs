@@ -76,6 +76,11 @@ impl OutboundAllowedHosts {
         Ok(is_allowed)
     }
 
+    /// Resolves and validates the configured allowed hosts.
+    pub async fn validate(&self) -> anyhow::Result<()> {
+        self.resolve().await.map(|_| ())
+    }
+
     async fn resolve(&self) -> anyhow::Result<Arc<AllowedHostsConfig>> {
         self.allowed_hosts_future
             .clone()
@@ -699,6 +704,8 @@ fn parse_service_chaining_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    use futures_util::FutureExt as _;
+
     impl AllowedHostConfig {
         fn new(scheme: SchemeConfig, host: HostConfig, port: PortConfig) -> Self {
             Self {
@@ -757,6 +764,20 @@ mod test {
             .collect();
 
         DummyResolver { variables }
+    }
+
+    #[test]
+    fn outbound_allowed_hosts_validation_awaits_shared_resolution() {
+        let future = futures_util::future::ready(Ok(Arc::new(AllowedHostsConfig::default())))
+            .boxed()
+            .shared();
+        let allowed_hosts = OutboundAllowedHosts::new(future, None);
+
+        allowed_hosts
+            .validate()
+            .now_or_never()
+            .expect("ready shared resolution should complete")
+            .unwrap();
     }
 
     fn empty_values_resolver() -> impl SyncResolver {
