@@ -119,14 +119,15 @@ impl spin_http::Host for crate::InstanceState {
             .await
             .map_err(|_| HttpError::TooManyRequests)?;
         let resp = client.execute(req).await.map_err(log_reqwest_error)?;
-        drop(permit);
 
         tracing::trace!("Returning response from outbound request to {req_url}");
         span.record(
             otel_attribute::HTTP_RESPONSE_STATUS_CODE,
             resp.status().as_u16(),
         );
-        response_from_reqwest(resp).await
+        let response = response_from_reqwest(resp).await;
+        drop(permit);
+        response
     }
 }
 
