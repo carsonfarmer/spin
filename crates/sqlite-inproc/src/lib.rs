@@ -47,6 +47,7 @@ impl InProcDatabaseLocation {
 pub struct InProcConnection {
     location: InProcDatabaseLocation,
     allow_attach_file: bool,
+    query_prepare_flags: rusqlite::PrepFlags,
     connection: OnceLock<Arc<Mutex<rusqlite::Connection>>>,
 }
 
@@ -55,10 +56,26 @@ impl InProcConnection {
         location: InProcDatabaseLocation,
         allow_attach_file: bool,
     ) -> Result<Self, sqlite::Error> {
+        Self::new_with_query_prepare_flags(
+            location,
+            allow_attach_file,
+            rusqlite::PrepFlags::empty(),
+        )
+    }
+
+    /// Creates a connection with custom flags for query preparation.
+    ///
+    /// Nonempty custom flags disable the prepared statement cache.
+    pub fn new_with_query_prepare_flags(
+        location: InProcDatabaseLocation,
+        allow_attach_file: bool,
+        query_prepare_flags: rusqlite::PrepFlags,
+    ) -> Result<Self, sqlite::Error> {
         let connection = OnceLock::new();
         Ok(Self {
             location,
             allow_attach_file,
+            query_prepare_flags,
             connection,
         })
     }
@@ -105,9 +122,16 @@ impl Connection for InProcConnection {
     ) -> Result<sqlite::QueryResult, sqlite::Error> {
         let connection = self.db_connection()?;
         let query = query.to_owned();
+        let query_prepare_flags = self.query_prepare_flags;
         // Tell the tokio runtime that we're going to block while making the query
         tokio::task::spawn_blocking(move || {
-            execute_query(&connection, &query, parameters, max_result_bytes)
+            execute_query(
+                &connection,
+                &query,
+                parameters,
+                max_result_bytes,
+                query_prepare_flags,
+            )
         })
         .await
         .context("internal runtime error")
@@ -122,6 +146,7 @@ impl Connection for InProcConnection {
     ) -> Result<QueryAsyncResult, v3::Error> {
         let connection = self.db_connection()?;
         let query = query.to_owned();
+        let query_prepare_flags = self.query_prepare_flags;
 
         let (cols_tx, cols_rx) = tokio::sync::oneshot::channel();
         let (rows_tx, rows_rx) = tokio::sync::mpsc::channel(4);
@@ -129,11 +154,11 @@ impl Connection for InProcConnection {
 
         let the_work = move || {
             let conn = connection.lock().unwrap();
-            let mut statement = match conn.prepare_cached(&query) {
-                Ok(s) => s,
-                Err(e) => {
+            let mut statement = match prepare_statement(&conn, &query, query_prepare_flags) {
+                Ok(statement) => statement,
+                Err(error) => {
                     _ = cols_tx.send(Default::default());
-                    return Err(io_error_v3(e));
+                    return Err(io_error_v3(error));
                 }
             };
             let columns: Vec<_> = statement
@@ -242,10 +267,10 @@ fn execute_query(
     query: &str,
     parameters: Vec<sqlite::Value>,
     max_result_bytes: usize,
+    query_prepare_flags: rusqlite::PrepFlags,
 ) -> Result<sqlite::QueryResult, sqlite::Error> {
     let conn = connection.lock().unwrap();
-    let mut statement = conn
-        .prepare_cached(query)
+    let mut statement = prepare_statement(&conn, query, query_prepare_flags)
         .map_err(|e| sqlite::Error::Io(e.to_string()))?;
     let columns = statement
         .column_names()
@@ -278,6 +303,45 @@ fn execute_query(
     Ok(sqlite::QueryResult { columns, rows })
 }
 
+enum PreparedStatement<'connection> {
+    Cached(rusqlite::CachedStatement<'connection>),
+    Direct(rusqlite::Statement<'connection>),
+}
+
+impl<'connection> std::ops::Deref for PreparedStatement<'connection> {
+    type Target = rusqlite::Statement<'connection>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Cached(statement) => statement,
+            Self::Direct(statement) => statement,
+        }
+    }
+}
+
+impl std::ops::DerefMut for PreparedStatement<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Cached(statement) => statement,
+            Self::Direct(statement) => statement,
+        }
+    }
+}
+
+fn prepare_statement<'connection>(
+    connection: &'connection rusqlite::Connection,
+    query: &str,
+    flags: rusqlite::PrepFlags,
+) -> rusqlite::Result<PreparedStatement<'connection>> {
+    if flags.is_empty() {
+        Ok(PreparedStatement::Cached(connection.prepare_cached(query)?))
+    } else {
+        Ok(PreparedStatement::Direct(
+            connection.prepare_with_flags(query, flags)?,
+        ))
+    }
+}
+
 fn convert_data(
     arguments: impl Iterator<Item = sqlite::Value>,
 ) -> impl Iterator<Item = rusqlite::types::Value> {
@@ -305,5 +369,51 @@ impl rusqlite::types::FromSql for ValueWrapper {
             rusqlite::types::ValueRef::Blob(b) => sqlite::Value::Blob(b.to_vec()),
         };
         Ok(ValueWrapper(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_prepare_flags_reject_virtual_tables_in_p2_and_p3() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                const QUERY: &str = "SELECT name FROM dbstat LIMIT 1";
+                let default = InProcConnection::new(InProcDatabaseLocation::InMemory, false)
+                    .expect("default connection");
+                let result = default
+                    .query(QUERY, Vec::new(), usize::MAX)
+                    .await
+                    .expect("bundled dbstat virtual table should be queryable");
+                assert_eq!(result.columns, ["name"]);
+
+                let restricted = InProcConnection::new_with_query_prepare_flags(
+                    InProcDatabaseLocation::InMemory,
+                    false,
+                    rusqlite::PrepFlags::SQLITE_PREPARE_NO_VTAB,
+                )
+                .expect("restricted connection");
+                let error = restricted
+                    .query(QUERY, Vec::new(), usize::MAX)
+                    .await
+                    .expect_err("P2 query should reject dbstat");
+                assert!(format!("{error:?}").contains("dbstat"));
+
+                let result = restricted
+                    .query_async(QUERY, Vec::new(), usize::MAX)
+                    .await
+                    .expect("P3 query should return a completion future");
+                assert!(result.columns.is_empty());
+                let error = result
+                    .error
+                    .await
+                    .expect("P3 completion sender")
+                    .expect_err("P3 completion should reject dbstat");
+                assert!(format!("{error:?}").contains("dbstat"));
+            });
     }
 }
