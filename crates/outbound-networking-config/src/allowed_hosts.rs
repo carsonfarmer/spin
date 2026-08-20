@@ -454,7 +454,12 @@ impl PartialAllowedHostConfig {
             Self::Exact(h) => Ok(Some(h)),
             Self::Unresolved(t) => {
                 let resolved = resolver.resolve_template(&t)?;
-                Self::parse_or_skip(&resolved)
+                Self::parse_or_skip(&resolved).map_err(|_| {
+                    anyhow::anyhow!(
+                        "allowed outbound host declaration {:?} resolved to an invalid configuration",
+                        t.to_string()
+                    )
+                })
             }
         }
     }
@@ -468,9 +473,11 @@ impl PartialAllowedHostConfig {
                 return Ok(());
             };
 
-            Self::parse_or_skip(&resolved).with_context(|| {
-                let template_str = template.to_string();
-                format!("using default variable value(s) with template {template_str:?} results in invalid config {resolved:?}")
+            Self::parse_or_skip(&resolved).map_err(|_| {
+                anyhow::anyhow!(
+                    "allowed outbound host declaration {:?} resolved to an invalid configuration",
+                    template.to_string()
+                )
             })?;
         }
         Ok(())
@@ -1236,6 +1243,35 @@ mod test {
         let hosts = &["http://{{ dbhost }}"];
         AllowedHostsConfig::validate(hosts, &resolver)
             .expect_err("bad variables make hosts invalid");
+    }
+
+    #[test]
+    fn resolved_values_are_not_exposed_by_parser_errors() {
+        const CANARY: &str = "resolved-secret-canary, invalid!";
+        let resolver = populated_resolver(&[("secret_host", CANARY)]);
+        let hosts = &["http://{{ secret_host }}"];
+
+        let parse_error = AllowedHostsConfig::parse(hosts, &resolver, &[])
+            .expect_err("invalid resolved host should fail parsing");
+        let validation_error = AllowedHostsConfig::validate(hosts, &resolver)
+            .expect_err("invalid resolved host should fail validation");
+
+        for error in [parse_error, validation_error] {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            let sources = error
+                .chain()
+                .skip(1)
+                .flat_map(|source| [source.to_string(), format!("{source:?}")])
+                .collect::<Vec<_>>()
+                .join("\n");
+            for rendered in [&display, &debug] {
+                assert!(rendered.contains("secret_host"), "{rendered}");
+            }
+            for rendered in [display, debug, sources] {
+                assert!(!rendered.contains(CANARY), "{rendered}");
+            }
+        }
     }
 
     #[test]
